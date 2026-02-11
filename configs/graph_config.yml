@@ -1,0 +1,45 @@
+version: 1.0.0
+runtime:
+  max_iterations: 4
+  divergence_patience: 2
+  checkpoint_dir: .checkpoints
+  default_timeout_seconds: 20
+  operation_timeouts:
+    analysis: 5
+    planning: 5
+    solving: 12
+    verification: 5
+llm:
+  enabled: true
+  require_available: true
+  provider: nvidia
+  model: moonshotai/kimi-k2.5
+  api_key_env: NVIDIA_API_KEY
+  temperature: 0.2
+  top_p: 1.0
+  max_completion_tokens: 8192
+  thinking: true
+  multimodal_enabled: true
+  max_image_bytes: 5242880
+precision:
+  symbolic_preferred_domains:
+    - calculo_i
+    - calculo_ii
+    - edo
+  numeric_tolerance: 1.0e-6
+  max_newton_iterations: 50
+resources:
+  max_expression_length: 400
+  max_terms: 200
+  cpu_budget_ms: 20000
+fallback:
+  symbolic_to_numeric: true
+  numeric_to_symbolic: false
+  on_timeout: return_partial
+security:
+  strict_sanitization: true
+  block_code_patterns:
+    - "__"
+    - "import"
+    - "exec"
+    - "eval"
