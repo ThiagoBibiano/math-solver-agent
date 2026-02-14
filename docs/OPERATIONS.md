@@ -35,5 +35,7 @@ pip install -e .[dev]
 
 - rode API e Streamlit no mesmo virtualenv.
 - mantenha `configs/graph_config.yml` versionado por ambiente.
+- prefira trocar `llm.model_profile` em vez de alterar código para mudar de modelo.
+- para modelos não multimodais (ex.: `deepseek_v3_2`), entrada de imagem é ignorada no payload de inferência.
 - não armazene chaves em código; use `.env` ou secrets do runtime.
 - monitore diretório de checkpoints (`.checkpoints/`) e limpe periodicamente.

@@ -47,7 +47,7 @@ math_solver_agent/
 
 ## Requisitos
 
-- Python `>=3.13`
+- Python `>=3.9`
 - Chave NVIDIA (`NVIDIA_API_KEY`)
 - Dependências do projeto
 
@@ -64,6 +64,38 @@ Configuração de ambiente:
 ```bash
 cp .env.example .env
 # editar .env e definir NVIDIA_API_KEY=...
+```
+
+## Seleção de modelo (flexível)
+
+A seleção do modelo fica na seção `llm` do `configs/graph_config.yml`.
+
+Campos principais:
+
+- `model_profile`: alias do perfil (recomendado)
+- `model`: id explícito do modelo (opcional; sobrescreve o id do perfil)
+- `temperature`, `top_p`, `max_tokens`: overrides de amostragem
+- `chat_template_kwargs`: kwargs específicos por modelo
+- `multimodal_enabled`: habilita imagem quando o modelo suporta
+
+Perfis prontos incluídos:
+
+- `kimi_k2_5` -> `moonshotai/kimi-k2.5` (multimodal)
+- `deepseek_v3_2` -> `deepseek-ai/deepseek-v3.2` (não multimodal)
+- `glm4_7` -> `z-ai/glm4.7` (multimodal)
+- `glm5` -> `z-ai/glm5` (multimodal)
+- `minimax_m2_1` -> `minimaxai/minimax-m2.1` (multimodal)
+
+Exemplo rápido (DeepSeek):
+
+```yaml
+llm:
+  model_profile: deepseek_v3_2
+  model: deepseek-ai/deepseek-v3.2
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 8192
+  multimodal_enabled: true # será automaticamente efetivo como false para esse modelo
 ```
 
 ## Execução
