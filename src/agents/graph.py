@@ -123,9 +123,9 @@ class MathSolverAgent:
         self.llm_client = GenerativeMathClient(config=self.config.llm)
         self.checkpoints = CheckpointStore(self.config.runtime.checkpoint_dir)
 
-        self._graph = self._build_langgraph() if StateGraph is not None else None
+        self._graph = self._build_langgraph(self.llm_client) if StateGraph is not None else None
 
-    def _build_langgraph(self) -> Optional[Any]:
+    def _build_langgraph(self, llm_client: GenerativeMathClient) -> Optional[Any]:
         """Builds LangGraph runtime with typed node topology.
 
         Returns:
@@ -141,7 +141,7 @@ class MathSolverAgent:
             "analyzer",
             lambda st: analyze_problem(
                 st,
-                llm_client=self.llm_client,
+                llm_client=llm_client,
                 prompt_pack=self.prompts.get("analyzer", {}),
             ),
         )
@@ -149,15 +149,15 @@ class MathSolverAgent:
             "converter",
             lambda st: convert_to_tool_syntax(
                 st,
-                llm_client=self.llm_client,
-                prompt_pack=self.prompts.get("converter", self.prompts.get("solver", {})),
+                llm_client=llm_client,
+                prompt_pack=self.prompts.get("converter", {}),
             ),
         )
         graph.add_node(
             "solver",
             lambda st: solve_problem(
                 st,
-                llm_client=self.llm_client,
+                llm_client=llm_client,
                 prompt_pack=self.prompts.get("solver", {}),
             ),
         )
@@ -165,7 +165,7 @@ class MathSolverAgent:
             "verifier",
             lambda st: verify_solution(
                 st,
-                llm_client=self.llm_client,
+                llm_client=llm_client,
                 prompt_pack=self.prompts.get("verifier", {}),
             ),
         )
@@ -192,6 +192,7 @@ class MathSolverAgent:
         image_url: Optional[str] = None,
         image_base64: Optional[str] = None,
         image_media_type: Optional[str] = None,
+        llm_overrides: Optional[Dict[str, Any]] = None,
     ) -> AgentState:
         """Runs a full solve cycle for one session.
 
@@ -203,6 +204,7 @@ class MathSolverAgent:
             image_url: Optional public image URL.
             image_base64: Optional inline image payload.
             image_media_type: Media type for inline image payload.
+            llm_overrides: Optional per-request LLM configuration overrides.
 
         Returns:
             Final agent state for the solve request.
@@ -219,10 +221,11 @@ class MathSolverAgent:
         else:
             state = self._new_state(problem, sid)
 
+        request_llm_client = self._resolve_request_llm_client(llm_overrides)
         state["prompt_variant"] = select_prompt_variant(self.prompt_config, sid)
-        state["llm"] = self.llm_client.describe()
+        state["llm"] = request_llm_client.describe()
         require_llm = bool(self.config.llm.get("require_available", True))
-        if require_llm and not self.llm_client.is_available:
+        if require_llm and not request_llm_client.is_available:
             state["status"] = "failed_precondition"
             state.setdefault("errors", []).append(
                 "Generative mode requires an available LLM provider. Check API key and provider dependencies."
@@ -239,9 +242,39 @@ class MathSolverAgent:
         else:
             state.setdefault("visual_input", {})
 
+        if self._graph is not None and request_llm_client is self.llm_client:
+            return self._run_langgraph(state, self._graph)
         if self._graph is not None:
-            return self._run_langgraph(state)
-        return self._run_fallback(state)
+            request_graph = self._build_langgraph(request_llm_client)
+            if request_graph is not None:
+                return self._run_langgraph(state, request_graph)
+        return self._run_fallback(state, request_llm_client)
+
+    def _resolve_request_llm_client(self, llm_overrides: Optional[Dict[str, Any]]) -> GenerativeMathClient:
+        """Resolves the LLM client for one request.
+
+        Args:
+            llm_overrides: Optional LLM settings passed at request time.
+
+        Returns:
+            Default client or a request-scoped client with merged settings.
+        """
+        if not llm_overrides:
+            return self.llm_client
+
+        effective_config = dict(self.config.llm)
+        for key, value in llm_overrides.items():
+            if value is None:
+                continue
+            if key in {"model_profiles", "chat_template_kwargs"}:
+                base_mapping = effective_config.get(key, {})
+                if isinstance(base_mapping, dict) and isinstance(value, dict):
+                    merged_mapping = dict(base_mapping)
+                    merged_mapping.update(value)
+                    effective_config[key] = merged_mapping
+                    continue
+            effective_config[key] = value
+        return GenerativeMathClient(config=effective_config)
 
     def _new_state(self, problem: str, session_id: str) -> AgentState:
         """Creates a fresh initial state for a session.
@@ -260,28 +293,28 @@ class MathSolverAgent:
             timeout_seconds=self.config.runtime.default_timeout_seconds,
         )
 
-    def _run_langgraph(self, state: AgentState) -> AgentState:
+    def _run_langgraph(self, state: AgentState, graph_runtime: Any) -> AgentState:
         """Executes the compiled graph and persists final checkpoint.
 
         Args:
             state: Input state for graph invocation.
+            graph_runtime: Compiled graph runtime instance.
 
         Returns:
             Final state returned by graph execution.
         """
-
-        assert self._graph is not None
         config = {"configurable": {"thread_id": state["session_id"]}}
-        out = self._graph.invoke(state, config=config)
+        out = graph_runtime.invoke(state, config=config)
         final_state = AgentState(**out)
         self.checkpoints.save(final_state)
         return final_state
 
-    def _run_fallback(self, state: AgentState) -> AgentState:
+    def _run_fallback(self, state: AgentState, llm_client: GenerativeMathClient) -> AgentState:
         """Executes node sequence using threaded node runner fallback.
 
         Args:
             state: Initial state for fallback run.
+            llm_client: Request-scoped LLM client.
 
         Returns:
             Final state produced by fallback execution.
@@ -292,7 +325,7 @@ class MathSolverAgent:
                 "analysis",
                 lambda st: analyze_problem(
                     st,
-                    llm_client=self.llm_client,
+                    llm_client=llm_client,
                     prompt_pack=self.prompts.get("analyzer", {}),
                 ),
                 state,
@@ -306,8 +339,8 @@ class MathSolverAgent:
                 "planning",
                 lambda st: convert_to_tool_syntax(
                     st,
-                    llm_client=self.llm_client,
-                    prompt_pack=self.prompts.get("converter", self.prompts.get("solver", {})),
+                    llm_client=llm_client,
+                    prompt_pack=self.prompts.get("converter", {}),
                 ),
                 state,
             )
@@ -320,7 +353,7 @@ class MathSolverAgent:
                 "solving",
                 lambda st: solve_problem(
                     st,
-                    llm_client=self.llm_client,
+                    llm_client=llm_client,
                     prompt_pack=self.prompts.get("solver", {}),
                 ),
                 state,
@@ -333,7 +366,7 @@ class MathSolverAgent:
                 "verification",
                 lambda st: verify_solution(
                     st,
-                    llm_client=self.llm_client,
+                    llm_client=llm_client,
                     prompt_pack=self.prompts.get("verifier", {}),
                 ),
                 state,

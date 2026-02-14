@@ -25,36 +25,56 @@ llm:
   max_image_bytes: 5242880
   model_profiles:
     deepseek_v3_2:
+      provider: nvidia
       model: deepseek-ai/deepseek-v3.2
       multimodal: false
-      temperature: 0.2
+      temperature: 1.0
       top_p: 0.95
       max_tokens: 8192
       chat_template_kwargs:
         thinking: true
     glm4_7:
+      provider: nvidia
       model: z-ai/glm4.7
       multimodal: true
-      temperature: 0.2
+      temperature: 1.0
       top_p: 1.0
       max_tokens: 16384
       chat_template_kwargs:
         enable_thinking: true
         clear_thinking: false
     glm5:
+      provider: nvidia
       model: z-ai/glm5
       multimodal: true
-      temperature: 0.2
+      temperature: 1.0
       top_p: 1.0
       max_tokens: 16384
       chat_template_kwargs:
         enable_thinking: true
         clear_thinking: false
     minimax_m2_1:
+      provider: nvidia
       model: minimaxai/minimax-m2.1
       multimodal: true
-      temperature: 0.2
+      temperature: 1.0
       top_p: 0.95
+      max_tokens: 8192
+      chat_template_kwargs: {}
+    sabia_4:
+      provider: maritaca
+      model: sabia-4
+      multimodal: false
+      temperature: 0.7
+      top_p: 1.0
+      max_tokens: 8192
+      chat_template_kwargs: {}
+    sabiazinho_4:
+      provider: maritaca
+      model: sabiazinho-4
+      multimodal: false
+      temperature: 0.7
+      top_p: 1.0
       max_tokens: 8192
       chat_template_kwargs: {}
 precision:

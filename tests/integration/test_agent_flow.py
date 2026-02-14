@@ -12,14 +12,18 @@ class _FakeGenerativeClient:
         self.is_available = True
 
     def describe(self):
+        provider = str(self.config.get("provider", "fake"))
+        model = str(self.config.get("model", "fake-model"))
+        model_profile = str(self.config.get("model_profile", "fake_profile"))
         return {
             "enabled": True,
-            "provider": "fake",
-            "model": "fake-model",
+            "provider": provider,
+            "model": model,
+            "model_profile": model_profile,
             "available": True,
             "reason": None,
             "multimodal_enabled": True,
-            "api_key_env": "NVIDIA_API_KEY",
+            "api_key_env": str(self.config.get("api_key_env", "NVIDIA_API_KEY")),
             "api_key_present": True,
         }
 
@@ -154,6 +158,44 @@ class AgentFlowIntegrationTestCase(unittest.TestCase):
                 )
 
             self.assertEqual(result.get("visual_input", {}).get("image_media_type"), "image/png")
+
+    def test_request_llm_overrides_are_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True, "provider": "nvidia", "model_profile": "kimi_k2_5", "model": "moonshotai/kimi-k2.5"},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": False}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(
+                    problem="2+2",
+                    llm_overrides={
+                        "provider": "maritaca",
+                        "model_profile": "sabia_4",
+                        "model": "sabia-4",
+                        "api_key_env": "MARITACA_API_KEY",
+                    },
+                )
+
+            self.assertEqual(result.get("llm", {}).get("provider"), "maritaca")
+            self.assertEqual(result.get("llm", {}).get("model"), "sabia-4")
+            self.assertEqual(result.get("llm", {}).get("api_key_env"), "MARITACA_API_KEY")
 
 
 if __name__ == "__main__":
