@@ -47,8 +47,8 @@ math_solver_agent/
 
 ## Requisitos
 
-- Python `>=3.9`
-- Chave NVIDIA (`NVIDIA_API_KEY`)
+- Python `>=3.13`
+- Chave NVIDIA (`NVIDIA_API_KEY`) ou MARITACA (`MARITACA_API_KEY`)
 - Dependências do projeto
 
 Instalação:
@@ -85,8 +85,8 @@ Perfis prontos incluídos:
 - `glm4_7` -> `z-ai/glm4.7` (multimodal)
 - `glm5` -> `z-ai/glm5` (multimodal)
 - `minimax_m2_1` -> `minimaxai/minimax-m2.1` (multimodal)
-- `sabia_4` -> `sabia-4` (Maritaca, text-to-text)
-- `sabiazinho_4` -> `sabiazinho-4` (Maritaca, text-to-text)
+- `sabia_4` -> `sabia-4` (Maritaca, não multimodal)
+- `sabiazinho_4` -> `sabiazinho-4` (Maritaca, não multimodal)
 
 Exemplo rápido (DeepSeek):
 
