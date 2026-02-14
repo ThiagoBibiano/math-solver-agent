@@ -263,6 +263,9 @@ class MathSolverAgent:
             return self.llm_client
 
         effective_config = dict(self.config.llm)
+        provider_override = str(llm_overrides.get("provider", "")).strip().lower() if llm_overrides else ""
+        has_provider_or_profile_override = bool(llm_overrides.get("provider") or llm_overrides.get("model_profile"))
+        has_explicit_model_override = bool(llm_overrides.get("model"))
         for key, value in llm_overrides.items():
             if value is None:
                 continue
@@ -274,6 +277,12 @@ class MathSolverAgent:
                     effective_config[key] = merged_mapping
                     continue
             effective_config[key] = value
+        if has_provider_or_profile_override and not has_explicit_model_override:
+            # Avoid stale model inheritance from base config (e.g. nvidia model
+            # kept while provider/profile switches to maritaca).
+            effective_config.pop("model", None)
+        if provider_override and "api_key_env" not in llm_overrides:
+            effective_config["api_key_env"] = "MARITACA_API_KEY" if provider_override == "maritaca" else "NVIDIA_API_KEY"
         return GenerativeMathClient(config=effective_config)
 
     def _new_state(self, problem: str, session_id: str) -> AgentState:

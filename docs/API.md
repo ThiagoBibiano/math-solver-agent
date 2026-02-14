@@ -23,11 +23,19 @@ Payload:
 - `image_url` (`string`, opcional)
 - `image_base64` (`string`, opcional)
 - `image_media_type` (`string`, opcional, default `image/png`)
+- `provider` (`string`, opcional)
+- `model_profile` (`string`, opcional)
+- `model` (`string`, opcional)
+- `api_key_env` (`string`, opcional)
+- `temperature` (`number`, opcional)
+- `top_p` (`number`, opcional)
+- `max_tokens` (`integer`, opcional)
 
 Regras:
 
 - precisa enviar `problem` ou imagem (`image_*`) quando `resume=false`;
 - no modo estrito, se LLM indisponível, retorna `503`.
+- em falha de chamada ao provider, retorna `502`.
 
 Resposta (resumo):
 
@@ -42,6 +50,7 @@ Resposta (resumo):
 - `verification`
 - `explanation`
 - `metrics`
+- `decision_trace` (lista de eventos intermediários)
 
 ## Solve Streaming
 

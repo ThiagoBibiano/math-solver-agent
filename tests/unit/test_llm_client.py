@@ -18,6 +18,11 @@ from src.llm.client import (
 )
 
 
+class _FakeChatMaritalk:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+
+
 class LLMClientTestCase(unittest.TestCase):
     def test_extract_json_from_fenced_block(self) -> None:
         content = """```json\n{\"domain\": \"calculo_i\", \"complexity_score\": 0.3}\n```"""
@@ -115,12 +120,51 @@ class LLMClientTestCase(unittest.TestCase):
         self.assertEqual(client.config.api_key_env, "MARITACA_API_KEY")
         self.assertFalse(client.config.multimodal_enabled)
 
+    def test_maritaca_clamps_temperature_and_max_tokens(self) -> None:
+        client = GenerativeMathClient(
+            config={
+                "enabled": False,
+                "provider": "maritaca",
+                "model_profile": "sabia_4",
+                "temperature": 0.0,
+                "max_tokens": 999999,
+            }
+        )
+        self.assertGreater(client.config.temperature, 0.0)
+        self.assertLess(client.config.temperature, 1.0)
+        self.assertEqual(client.config.max_tokens, 8192)
+
+    def test_provider_override_avoids_stale_api_key_env(self) -> None:
+        client = GenerativeMathClient(
+            config={
+                "enabled": False,
+                "provider": "maritaca",
+                "model_profile": "sabia_4",
+                "api_key_env": "NVIDIA_API_KEY",
+            }
+        )
+        self.assertEqual(client.config.provider, "maritaca")
+        self.assertEqual(client.config.api_key_env, "MARITACA_API_KEY")
+
     def test_render_prompt_template_with_context(self) -> None:
         template = "Problem: {{problem}} | Iter: {{iteration}} | Ctx: {{analysis}}"
         rendered = _render_prompt_template(template, {"problem": "x^2", "iteration": 2, "analysis": {"domain": "calculo_i"}})
         self.assertIn("Problem: x^2", rendered)
         self.assertIn("Iter: 2", rendered)
         self.assertIn('\"domain\": \"calculo_i\"', rendered)
+
+    def test_maritaca_uses_langchain_community_client(self) -> None:
+        with patch.dict(os.environ, {"MARITACA_API_KEY": "test-key"}, clear=False), patch(
+            "src.llm.client.ChatMaritalk", _FakeChatMaritalk
+        ):
+            client = GenerativeMathClient(
+                config={
+                    "provider": "maritaca",
+                    "model_profile": "sabiazinho_4",
+                }
+            )
+        self.assertTrue(client.is_available)
+        self.assertIsInstance(client._client, _FakeChatMaritalk)
 
 
 if __name__ == "__main__":

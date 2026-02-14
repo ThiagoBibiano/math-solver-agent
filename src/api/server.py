@@ -9,11 +9,12 @@ from src.utils.exporters import export_latex, export_notebook
 from src.utils.logger import get_logger
 
 try:  # pragma: no cover
-    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     FastAPI = None  # type: ignore[assignment]
     HTTPException = Exception  # type: ignore[assignment]
+    Request = Any  # type: ignore[misc,assignment]
     WebSocket = Any  # type: ignore[misc,assignment]
     WebSocketDisconnect = Exception  # type: ignore[assignment]
     BaseModel = object  # type: ignore[assignment]
@@ -56,6 +57,7 @@ if FastAPI is not None:
         verification: Dict[str, Any]
         explanation: str
         metrics: Dict[str, float]
+        decision_trace: list[Dict[str, Any]]
 
 
     class ExportRequest(BaseModel):
@@ -122,21 +124,42 @@ def create_app() -> Any:
         return {"status": "ok"}
 
     @app.post("/v1/solve", response_model=SolveResponse)
-    async def solve(payload: SolveRequest) -> Dict[str, Any]:
+    async def solve(payload: SolveRequest, request: Request) -> Dict[str, Any]:
+        request_id = request.headers.get("X-Request-ID", "-")
+        logger.info(
+            "solve_start request_id=%s provider=%s model_profile=%s has_problem=%s has_image=%s session_id=%s",
+            request_id,
+            payload.provider,
+            payload.model_profile,
+            bool(payload.problem),
+            bool(payload.image_path or payload.image_url or payload.image_base64),
+            payload.session_id,
+        )
         if not payload.problem and not payload.resume and not any([payload.image_path, payload.image_url, payload.image_base64]):
             raise HTTPException(status_code=422, detail="problem or image input is required unless resume=true")
-        state = agent.solve(
-            problem=payload.problem,
-            session_id=payload.session_id,
-            resume=payload.resume,
-            image_path=payload.image_path,
-            image_url=payload.image_url,
-            image_base64=payload.image_base64,
-            image_media_type=payload.image_media_type,
-            llm_overrides=_build_llm_overrides(payload),
-        )
+        try:
+            state = agent.solve(
+                problem=payload.problem,
+                session_id=payload.session_id,
+                resume=payload.resume,
+                image_path=payload.image_path,
+                image_url=payload.image_url,
+                image_base64=payload.image_base64,
+                image_media_type=payload.image_media_type,
+                llm_overrides=_build_llm_overrides(payload),
+            )
+        except Exception as exc:
+            logger.exception("solve_failed request_id=%s error=%s", request_id, exc)
+            raise HTTPException(status_code=502, detail="Provider call failed: {}".format(exc)) from exc
         if state.get("status") == "failed_precondition":
             raise HTTPException(status_code=503, detail="LLM provider unavailable in strict generative mode.")
+        logger.info(
+            "solve_done request_id=%s status=%s model=%s session_id=%s",
+            request_id,
+            state.get("status"),
+            state.get("llm", {}).get("model"),
+            state.get("session_id"),
+        )
         return {
             "session_id": state.get("session_id"),
             "status": state.get("status"),
@@ -149,6 +172,7 @@ def create_app() -> Any:
             "verification": state.get("verification", {}),
             "explanation": state.get("explanation", ""),
             "metrics": state.get("metrics", {}),
+            "decision_trace": state.get("decision_trace", []),
         }
 
     @app.websocket("/v1/solve/stream")
