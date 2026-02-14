@@ -7,7 +7,7 @@ import json
 import mimetypes
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -21,6 +21,11 @@ try:  # pragma: no cover
     from langchain_nvidia_ai_endpoints import ChatNVIDIA
 except ImportError:  # pragma: no cover
     ChatNVIDIA = None  # type: ignore[assignment]
+
+try:  # pragma: no cover
+    from langchain_community.chat_models import ChatMaritalk
+except ImportError:  # pragma: no cover
+    ChatMaritalk = None  # type: ignore[assignment]
 
 try:  # pragma: no cover
     from langchain_core.messages import HumanMessage, SystemMessage
@@ -37,11 +42,14 @@ class LLMRuntimeConfig:
         enabled: Enables or disables the client bootstrap.
         provider: Provider name supported by this client facade.
         model: Provider model identifier.
+        model_profile: Model profile alias used to load defaults.
         api_key_env: Preferred environment variable for the API key.
         temperature: Sampling temperature used by chat completions.
         top_p: Nucleus sampling parameter.
-        max_completion_tokens: Maximum number of output tokens.
+        max_tokens: Maximum number of output tokens.
         thinking: Enables provider-specific reasoning mode when supported.
+        chat_template_kwargs: Runtime chat template options sent to provider.
+        model_profiles: Optional custom/override model profile registry.
         multimodal_enabled: Enables image input in chat messages.
         max_image_bytes: Maximum image payload size accepted for local files.
     """
@@ -49,13 +57,115 @@ class LLMRuntimeConfig:
     enabled: bool = True
     provider: str = "nvidia"
     model: str = "moonshotai/kimi-k2.5"
+    model_profile: str = "kimi_k2_5"
     api_key_env: str = "NVIDIA_API_KEY"
     temperature: float = 0.2
     top_p: float = 1.0
-    max_completion_tokens: int = 8192
+    max_tokens: int = 8192
     thinking: bool = True
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
+    model_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     multimodal_enabled: bool = True
     max_image_bytes: int = 5242880
+
+
+@dataclass
+class ModelProfile:
+    """Represents provider defaults and capabilities for one model family.
+
+    Attributes:
+        alias: Human-friendly alias used in config.
+        provider: Backend provider name for this model.
+        model: Provider model identifier.
+        multimodal: Whether image inputs are supported.
+        default_temperature: Default temperature for this model.
+        default_top_p: Default top_p for this model.
+        default_max_tokens: Default max token budget for this model.
+        chat_template_kwargs: Provider-specific template kwargs.
+    """
+
+    alias: str
+    provider: str
+    model: str
+    multimodal: bool
+    default_temperature: float
+    default_top_p: float
+    default_max_tokens: int
+    chat_template_kwargs: Dict[str, Any] = field(default_factory=dict)
+
+
+_DEFAULT_MODEL_PROFILES: Dict[str, ModelProfile] = {
+    "kimi_k2_5": ModelProfile(
+        alias="kimi_k2_5",
+        provider="nvidia",
+        model="moonshotai/kimi-k2.5",
+        multimodal=True,
+        default_temperature=1.0,
+        default_top_p=1.0,
+        default_max_tokens=16384,
+        chat_template_kwargs={"thinking": True},
+    ),
+    "deepseek_v3_2": ModelProfile(
+        alias="deepseek_v3_2",
+        provider="nvidia",
+        model="deepseek-ai/deepseek-v3.2",
+        multimodal=False,
+        default_temperature=1.0,
+        default_top_p=0.95,
+        default_max_tokens=8192,
+        chat_template_kwargs={"thinking": True},
+    ),
+    "glm4_7": ModelProfile(
+        alias="glm4_7",
+        provider="nvidia",
+        model="z-ai/glm4.7",
+        multimodal=True,
+        default_temperature=1.0,
+        default_top_p=1.0,
+        default_max_tokens=16384,
+        chat_template_kwargs={"enable_thinking": True, "clear_thinking": False},
+    ),
+    "glm5": ModelProfile(
+        alias="glm5",
+        provider="nvidia",
+        model="z-ai/glm5",
+        multimodal=True,
+        default_temperature=1.0,
+        default_top_p=1.0,
+        default_max_tokens=16384,
+        chat_template_kwargs={"enable_thinking": True, "clear_thinking": False},
+    ),
+    "minimax_m2_1": ModelProfile(
+        alias="minimax_m2_1",
+        provider="nvidia",
+        model="minimaxai/minimax-m2.1",
+        multimodal=True,
+        default_temperature=1.0,
+        default_top_p=0.95,
+        default_max_tokens=8192,
+        chat_template_kwargs={},
+    ),
+    "sabia_4": ModelProfile(
+        alias="sabia_4",
+        provider="maritaca",
+        model="sabia-4",
+        multimodal=False,
+        default_temperature=0.7,
+        default_top_p=1.0,
+        default_max_tokens=8192,
+        chat_template_kwargs={},
+    ),
+    "sabiazinho_4": ModelProfile(
+        alias="sabiazinho_4",
+        provider="maritaca",
+        model="sabiazinho-4",
+        multimodal=False,
+        default_temperature=0.7,
+        default_top_p=1.0,
+        default_max_tokens=8192,
+        chat_template_kwargs={},
+    ),
+}
 
 
 class GenerativeMathClient:
@@ -74,18 +184,46 @@ class GenerativeMathClient:
             config: Optional runtime settings overriding defaults.
         """
         raw = config or {}
+        requested_provider = str(raw.get("provider", "")).strip()
+        profile_registry = _build_model_profile_registry(raw.get("model_profiles"))
+        selected_profile = _resolve_model_profile(
+            model_alias=str(raw.get("model_profile", "kimi_k2_5")),
+            explicit_model=str(raw.get("model", "")),
+            registry=profile_registry,
+            provider_hint=requested_provider or None,
+        )
+        provider_value = requested_provider or selected_profile.provider
+
+        temperature_value = float(raw.get("temperature", selected_profile.default_temperature))
+        top_p_value = float(raw.get("top_p", selected_profile.default_top_p))
+        max_tokens_raw = raw.get("max_tokens", raw.get("max_completion_tokens", selected_profile.default_max_tokens))
+        max_tokens_value = int(max_tokens_raw)
+
+        profile_chat_kwargs = dict(selected_profile.chat_template_kwargs)
+        explicit_chat_kwargs = raw.get("chat_template_kwargs")
+        if isinstance(explicit_chat_kwargs, dict):
+            profile_chat_kwargs.update(explicit_chat_kwargs)
+        elif bool(raw.get("thinking", True)) and not profile_chat_kwargs:
+            profile_chat_kwargs = {"thinking": True}
+
+        multimodal_enabled = bool(raw.get("multimodal_enabled", True)) and selected_profile.multimodal
+
         self.config = LLMRuntimeConfig(
             enabled=bool(raw.get("enabled", True)),
-            provider=str(raw.get("provider", "nvidia")),
-            model=str(raw.get("model", "moonshotai/kimi-k2.5")),
-            api_key_env=str(raw.get("api_key_env", "NVIDIA_API_KEY")),
-            temperature=float(raw.get("temperature", 0.2)),
-            top_p=float(raw.get("top_p", 1.0)),
-            max_completion_tokens=int(raw.get("max_completion_tokens", 8192)),
+            provider=provider_value,
+            model=selected_profile.model,
+            model_profile=selected_profile.alias,
+            api_key_env=str(raw.get("api_key_env", _default_api_key_env(provider_value))),
+            temperature=temperature_value,
+            top_p=top_p_value,
+            max_tokens=max_tokens_value,
             thinking=bool(raw.get("thinking", True)),
-            multimodal_enabled=bool(raw.get("multimodal_enabled", True)),
+            chat_template_kwargs=profile_chat_kwargs,
+            model_profiles={},
+            multimodal_enabled=multimodal_enabled,
             max_image_bytes=int(raw.get("max_image_bytes", 5242880)),
         )
+        self.model_profile = selected_profile
 
         self._client: Optional[Any] = None
         self._unavailable_reason: Optional[str] = None
@@ -111,9 +249,12 @@ class GenerativeMathClient:
             "enabled": self.config.enabled,
             "provider": self.config.provider,
             "model": self.config.model,
+            "model_profile": self.config.model_profile,
             "available": self.is_available,
             "reason": self._unavailable_reason,
             "multimodal_enabled": self.config.multimodal_enabled,
+            "supports_multimodal": self.model_profile.multimodal,
+            "chat_template_kwargs": self.config.chat_template_kwargs,
             "api_key_env": self.config.api_key_env,
             "api_key_present": api_key_present,
         }
@@ -123,13 +264,10 @@ class GenerativeMathClient:
         if not self.config.enabled:
             self._unavailable_reason = "disabled_by_config"
             return
-        if self.config.provider != "nvidia":
+        if self.config.provider not in {"nvidia", "maritaca"}:
             self._unavailable_reason = "unsupported_provider"
             return
         _load_environment_variables()
-        if ChatNVIDIA is None:
-            self._unavailable_reason = "missing_dependency_langchain_nvidia_ai_endpoints"
-            return
 
         api_key = _resolve_api_key(self._key_candidates())
 
@@ -137,12 +275,28 @@ class GenerativeMathClient:
             self._unavailable_reason = "missing_api_key"
             return
 
-        self._client = ChatNVIDIA(
+        if self.config.provider == "nvidia":
+            if ChatNVIDIA is None:
+                self._unavailable_reason = "missing_dependency_langchain_nvidia_ai_endpoints"
+                return
+            self._client = ChatNVIDIA(
+                model=self.config.model,
+                api_key=api_key,
+                temperature=self.config.temperature,
+                top_p=self.config.top_p,
+                max_tokens=self.config.max_tokens,
+                extra_body=self._extra_body(),
+            )
+            return
+
+        if ChatMaritalk is None:
+            self._unavailable_reason = "missing_dependency_langchain_community"
+            return
+        self._client = ChatMaritalk(
             model=self.config.model,
             api_key=api_key,
             temperature=self.config.temperature,
-            top_p=self.config.top_p,
-            max_completion_tokens=self.config.max_completion_tokens,
+            max_tokens=self.config.max_tokens,
         )
 
     def _key_candidates(self) -> List[str]:
@@ -151,6 +305,8 @@ class GenerativeMathClient:
         Returns:
             A list of environment variable names.
         """
+        if self.config.provider == "maritaca":
+            return [self.config.api_key_env, "MARITACA_API_KEY", "maritaca_api_key"]
         return [self.config.api_key_env, "NVIDIA_API_KEY", "nvidia_api_key"]
 
     def stream(self, messages: List[Dict[str, str]]) -> Iterable[Dict[str, str]]:
@@ -178,7 +334,7 @@ class GenerativeMathClient:
             Dictionaries with reasoning and textual token content.
         """
         assert self._client is not None
-        for chunk in self._client.stream(messages, chat_template_kwargs={"thinking": self.config.thinking}):
+        for chunk in self._client.stream(messages, **self._invocation_kwargs()):
             reasoning = ""
             if getattr(chunk, "additional_kwargs", None) and "reasoning_content" in chunk.additional_kwargs:
                 reasoning = str(chunk.additional_kwargs["reasoning_content"])
@@ -214,9 +370,39 @@ class GenerativeMathClient:
         )
         response = self._client.invoke(
             messages,
-            chat_template_kwargs={"thinking": self.config.thinking},
+            **self._invocation_kwargs(),
         )
         return str(getattr(response, "content", "") or "")
+
+    def _invocation_kwargs(self) -> Dict[str, Any]:
+        """Builds provider invocation kwargs from effective runtime settings.
+
+        Returns:
+            Invocation kwargs with provider-specific template options.
+        """
+        chat_kwargs = self.config.chat_template_kwargs
+        if self.config.provider != "nvidia":
+            return {}
+        if not chat_kwargs and self.config.thinking:
+            chat_kwargs = {"thinking": True}
+        if not chat_kwargs:
+            return {}
+        return {"extra_body": {"chat_template_kwargs": chat_kwargs}}
+
+    def _extra_body(self) -> Dict[str, Any]:
+        """Builds constructor extra_body for provider-specific options.
+
+        Returns:
+            Extra body dictionary used during client construction.
+        """
+        chat_kwargs = self.config.chat_template_kwargs
+        if self.config.provider != "nvidia":
+            return {}
+        if not chat_kwargs and self.config.thinking:
+            chat_kwargs = {"thinking": True}
+        if not chat_kwargs:
+            return {}
+        return {"chat_template_kwargs": chat_kwargs}
 
     def invoke_json(
         self,
@@ -268,14 +454,23 @@ class GenerativeMathClient:
             "system",
             "Você é um analisador matemático rigoroso. Responda apenas JSON válido.",
         )
-        user = (
+        default_user = (
             "Analise o problema e retorne SOMENTE JSON no formato: "
             "{{\"domain\": string, \"constraints\": string[], \"complexity_score\": number entre 0 e 1, "
             "\"plan\": string[], \"normalized_problem\": string}}. "
             "Use os domínios: calculo_i, calculo_ii, calculo_iii, edo, algebra_linear. "
             "Se houver imagem anexada, extraia o enunciado matemático da imagem antes de classificar. "
-            "Variant={} HasImage={} Problema: {}"
-        ).format(prompt_variant or "default", has_image, problem)
+            "Variant={{prompt_variant}} HasImage={{has_image}} Problema: {{problem}}"
+        )
+        user_template = (prompt_pack or {}).get("user", default_user)
+        user = _render_prompt_template(
+            user_template,
+            {
+                "problem": problem,
+                "prompt_variant": prompt_variant or "default",
+                "has_image": has_image,
+            },
+        )
         return self.invoke_json(system, user, default={}, image_input=image_input)
 
     def propose_strategy(
@@ -306,12 +501,22 @@ class GenerativeMathClient:
             "system",
             "Você é um planejador matemático. Responda apenas JSON válido.",
         )
-        user = (
+        default_user = (
             "Com base no problema e análise, retorne SOMENTE JSON: "
             "{{\"strategy\": \"symbolic|numeric|hybrid\", \"expression\": string, \"steps\": string[], \"notes\": string}}. "
             "Se houver imagem anexada, considere o conteúdo visual na estratégia. "
-            "Iteração={} HasImage={} Problema={} Analise={}"
-        ).format(iteration, has_image, problem, json.dumps(analysis, ensure_ascii=True))
+            "Iteração={{iteration}} HasImage={{has_image}} Problema={{problem}} Analise={{analysis}}"
+        )
+        user_template = (prompt_pack or {}).get("user", default_user)
+        user = _render_prompt_template(
+            user_template,
+            {
+                "problem": problem,
+                "analysis": analysis,
+                "iteration": iteration,
+                "has_image": has_image,
+            },
+        )
         return self.invoke_json(system, user, default={}, image_input=image_input)
 
     def plan_tool_execution(
@@ -342,7 +547,7 @@ class GenerativeMathClient:
             "system",
             "Você é um conversor de linguagem natural para chamadas de ferramentas matemáticas.",
         )
-        user = (
+        default_user = (
             "Retorne SOMENTE JSON no formato "
             "{{\"strategy\": \"symbolic|numeric|hybrid\", "
             "\"normalized_problem\": string, "
@@ -351,8 +556,18 @@ class GenerativeMathClient:
             "Ferramentas permitidas: differentiate_expression, integrate_expression, solve_equation, "
             "simplify_expression, evaluate_expression, numerical_integration, solve_ode. "
             "Nao inclua texto fora do JSON. "
-            "Iteracao={} HasImage={} Problem={} Analysis={}"
-        ).format(iteration, has_image, problem, json.dumps(analysis, ensure_ascii=True))
+            "Iteracao={{iteration}} HasImage={{has_image}} Problem={{problem}} Analysis={{analysis}}"
+        )
+        user_template = (prompt_pack or {}).get("user", default_user)
+        user = _render_prompt_template(
+            user_template,
+            {
+                "problem": problem,
+                "analysis": analysis,
+                "iteration": iteration,
+                "has_image": has_image,
+            },
+        )
         return self.invoke_json(system, user, default={}, image_input=image_input)
 
     def generate_explanation(
@@ -376,10 +591,12 @@ class GenerativeMathClient:
             "system",
             "Você é um tutor de cálculo e deve explicar com rigor e clareza.",
         )
-        user = (
+        default_user = (
             "Gere uma explicação pedagógica em PT-BR com passos, teoremas aplicados, alertas de erros comuns "
-            "e interpretação intuitiva. Contexto JSON: {}"
-        ).format(json.dumps(state_summary, ensure_ascii=True))
+            "e interpretação intuitiva. Contexto JSON: {{state_summary}}"
+        )
+        user_template = (prompt_pack or {}).get("user", default_user)
+        user = _render_prompt_template(user_template, {"state_summary": state_summary})
         return self.invoke_text(system, user).strip()
 
 
@@ -417,6 +634,36 @@ def _extract_json_dict(text: str, default: Dict[str, Any]) -> Dict[str, Any]:
         return default
 
     return default
+
+
+def _render_prompt_template(template: str, context: Dict[str, Any]) -> str:
+    """Renders a simple `{{key}}` prompt template using context values.
+
+    Args:
+        template: Template string with placeholders in `{{key}}` form.
+        context: Values available for placeholder replacement.
+
+    Returns:
+        Rendered string with available keys replaced.
+    """
+    rendered = template
+    for key, value in context.items():
+        rendered = rendered.replace("{{" + str(key) + "}}", _stringify_template_value(value))
+    return rendered
+
+
+def _stringify_template_value(value: Any) -> str:
+    """Converts context values into template-safe strings.
+
+    Args:
+        value: Value to convert.
+
+    Returns:
+        String representation suitable for prompt templates.
+    """
+    if isinstance(value, (dict, list, tuple)):
+        return json.dumps(value, ensure_ascii=True)
+    return str(value)
 
 
 def _build_langchain_messages(
@@ -524,6 +771,151 @@ def _guess_media_type(path: Path) -> Optional[str]:
     if guessed and guessed.startswith("image/"):
         return guessed
     return None
+
+
+def _build_model_profile_registry(raw_profiles: Any) -> Dict[str, ModelProfile]:
+    """Builds model profile registry from defaults and optional overrides.
+
+    Args:
+        raw_profiles: Optional dictionary containing profile overrides.
+
+    Returns:
+        Registry mapping aliases to `ModelProfile`.
+    """
+    registry: Dict[str, ModelProfile] = dict(_DEFAULT_MODEL_PROFILES)
+    if not isinstance(raw_profiles, dict):
+        return registry
+
+    for alias, value in raw_profiles.items():
+        if not isinstance(value, dict):
+            continue
+        profile = _profile_from_mapping(str(alias), value)
+        if profile is not None:
+            registry[str(alias)] = profile
+    return registry
+
+
+def _profile_from_mapping(alias: str, payload: Dict[str, Any]) -> Optional[ModelProfile]:
+    """Creates a model profile from generic mapping data.
+
+    Args:
+        alias: Profile alias.
+        payload: Profile settings dictionary.
+
+    Returns:
+        Parsed `ModelProfile` or None if payload is invalid.
+    """
+    model = str(payload.get("model", "")).strip()
+    if not model:
+        return None
+    return ModelProfile(
+        alias=alias,
+        provider=str(payload.get("provider", "nvidia")).strip() or "nvidia",
+        model=model,
+        multimodal=bool(payload.get("multimodal", True)),
+        default_temperature=float(payload.get("temperature", 1.0)),
+        default_top_p=float(payload.get("top_p", 1.0)),
+        default_max_tokens=int(payload.get("max_tokens", payload.get("max_completion_tokens", 8192))),
+        chat_template_kwargs=dict(payload.get("chat_template_kwargs", {})),
+    )
+
+
+def _resolve_model_profile(
+    model_alias: str,
+    explicit_model: str,
+    registry: Dict[str, ModelProfile],
+    provider_hint: Optional[str] = None,
+) -> ModelProfile:
+    """Resolves effective model profile using alias and/or explicit model id.
+
+    Args:
+        model_alias: Preferred alias from config.
+        explicit_model: Explicit model id from config.
+        registry: Available model profile registry.
+        provider_hint: Optional provider constraint (e.g., nvidia, maritaca).
+
+    Returns:
+        Resolved model profile.
+    """
+    alias = (model_alias or "").strip()
+    if alias and alias in registry:
+        profile = registry[alias]
+        if provider_hint and profile.provider != provider_hint:
+            profile = None
+        if profile and explicit_model.strip():
+            return ModelProfile(
+                alias=profile.alias,
+                provider=profile.provider,
+                model=explicit_model.strip(),
+                multimodal=profile.multimodal,
+                default_temperature=profile.default_temperature,
+                default_top_p=profile.default_top_p,
+                default_max_tokens=profile.default_max_tokens,
+                chat_template_kwargs=dict(profile.chat_template_kwargs),
+            )
+        if profile:
+            return profile
+
+    explicit = explicit_model.strip()
+    if explicit:
+        for profile in registry.values():
+            if profile.model == explicit and (not provider_hint or profile.provider == provider_hint):
+                return profile
+        return ModelProfile(
+            alias=_slugify_model_alias(explicit),
+            provider=provider_hint or "nvidia",
+            model=explicit,
+            multimodal=True,
+            default_temperature=1.0,
+            default_top_p=1.0,
+            default_max_tokens=8192,
+            chat_template_kwargs={},
+        )
+
+    return _default_profile_for_provider(provider_hint, registry)
+
+
+def _slugify_model_alias(model_name: str) -> str:
+    """Converts model identifier into a stable alias.
+
+    Args:
+        model_name: Provider model identifier.
+
+    Returns:
+        Alias-safe slug string.
+    """
+    return re.sub(r"[^a-z0-9_]+", "_", model_name.lower()).strip("_")
+
+
+def _default_profile_for_provider(provider_hint: Optional[str], registry: Dict[str, ModelProfile]) -> ModelProfile:
+    """Returns default profile for a provider hint.
+
+    Args:
+        provider_hint: Optional provider name.
+        registry: Available profile registry.
+
+    Returns:
+        A profile matching provider preference when possible.
+    """
+    if provider_hint:
+        for profile in registry.values():
+            if profile.provider == provider_hint:
+                return profile
+    return registry["kimi_k2_5"]
+
+
+def _default_api_key_env(provider: str) -> str:
+    """Returns default API key environment variable for provider.
+
+    Args:
+        provider: Provider name.
+
+    Returns:
+        Environment variable name.
+    """
+    if provider == "maritaca":
+        return "MARITACA_API_KEY"
+    return "NVIDIA_API_KEY"
 
 
 def _load_environment_variables() -> None:

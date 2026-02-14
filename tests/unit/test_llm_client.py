@@ -5,7 +5,11 @@ import tempfile
 from unittest.mock import patch
 
 from src.llm.client import (
+    _build_model_profile_registry,
     GenerativeMathClient,
+    _render_prompt_template,
+    _resolve_model_profile,
+    _slugify_model_alias,
     _build_human_content,
     _extract_json_dict,
     _manual_load_env_file,
@@ -65,6 +69,58 @@ class LLMClientTestCase(unittest.TestCase):
             with patch.dict(os.environ, {}, clear=True):
                 _manual_load_env_file(env_path)
                 self.assertEqual(os.getenv("NVIDIA_API_KEY"), "abc123")
+
+    def test_resolve_model_profile_from_alias(self) -> None:
+        registry = _build_model_profile_registry(None)
+        profile = _resolve_model_profile("glm5", "", registry)
+        self.assertEqual(profile.model, "z-ai/glm5")
+        self.assertTrue(profile.multimodal)
+
+    def test_resolve_model_profile_from_explicit_model(self) -> None:
+        registry = _build_model_profile_registry(None)
+        profile = _resolve_model_profile("", "deepseek-ai/deepseek-v3.2", registry)
+        self.assertEqual(profile.alias, "deepseek_v3_2")
+        self.assertFalse(profile.multimodal)
+
+    def test_slugify_model_alias(self) -> None:
+        self.assertEqual(_slugify_model_alias("deepseek-ai/deepseek-v3.2"), "deepseek_ai_deepseek_v3_2")
+
+    def test_config_disables_multimodal_for_non_multimodal_model(self) -> None:
+        client = GenerativeMathClient(
+            config={
+                "enabled": False,
+                "model_profile": "deepseek_v3_2",
+                "multimodal_enabled": True,
+            }
+        )
+        self.assertFalse(client.config.multimodal_enabled)
+
+    def test_maritaca_profile_resolution(self) -> None:
+        registry = _build_model_profile_registry(None)
+        profile = _resolve_model_profile("sabiazinho_4", "", registry, provider_hint="maritaca")
+        self.assertEqual(profile.provider, "maritaca")
+        self.assertEqual(profile.model, "sabiazinho-4")
+        self.assertFalse(profile.multimodal)
+
+    def test_maritaca_client_defaults(self) -> None:
+        client = GenerativeMathClient(
+            config={
+                "enabled": False,
+                "provider": "maritaca",
+                "model_profile": "sabia_4",
+            }
+        )
+        self.assertEqual(client.config.provider, "maritaca")
+        self.assertEqual(client.config.model, "sabia-4")
+        self.assertEqual(client.config.api_key_env, "MARITACA_API_KEY")
+        self.assertFalse(client.config.multimodal_enabled)
+
+    def test_render_prompt_template_with_context(self) -> None:
+        template = "Problem: {{problem}} | Iter: {{iteration}} | Ctx: {{analysis}}"
+        rendered = _render_prompt_template(template, {"problem": "x^2", "iteration": 2, "analysis": {"domain": "calculo_i"}})
+        self.assertIn("Problem: x^2", rendered)
+        self.assertIn("Iter: 2", rendered)
+        self.assertIn('\"domain\": \"calculo_i\"', rendered)
 
 
 if __name__ == "__main__":

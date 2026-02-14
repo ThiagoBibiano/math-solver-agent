@@ -48,7 +48,7 @@ math_solver_agent/
 ## Requisitos
 
 - Python `>=3.13`
-- Chave NVIDIA (`NVIDIA_API_KEY`)
+- Chave NVIDIA (`NVIDIA_API_KEY`) ou MARITACA (`MARITACA_API_KEY`)
 - Dependências do projeto
 
 Instalação:
@@ -64,6 +64,52 @@ Configuração de ambiente:
 ```bash
 cp .env.example .env
 # editar .env e definir NVIDIA_API_KEY=...
+```
+
+## Seleção de modelo (flexível)
+
+A seleção do modelo fica na seção `llm` do `configs/graph_config.yml`.
+
+Campos principais:
+
+- `model_profile`: alias do perfil (recomendado)
+- `model`: id explícito do modelo (opcional; sobrescreve o id do perfil)
+- `temperature`, `top_p`, `max_tokens`: overrides de amostragem
+- `chat_template_kwargs`: kwargs específicos por modelo
+- `multimodal_enabled`: habilita imagem quando o modelo suporta
+
+Perfis prontos incluídos:
+
+- `kimi_k2_5` -> `moonshotai/kimi-k2.5` (multimodal)
+- `deepseek_v3_2` -> `deepseek-ai/deepseek-v3.2` (não multimodal)
+- `glm4_7` -> `z-ai/glm4.7` (multimodal)
+- `glm5` -> `z-ai/glm5` (multimodal)
+- `minimax_m2_1` -> `minimaxai/minimax-m2.1` (multimodal)
+- `sabia_4` -> `sabia-4` (Maritaca, não multimodal)
+- `sabiazinho_4` -> `sabiazinho-4` (Maritaca, não multimodal)
+
+Exemplo rápido (DeepSeek):
+
+```yaml
+llm:
+  model_profile: deepseek_v3_2
+  model: deepseek-ai/deepseek-v3.2
+  temperature: 1.0
+  top_p: 0.95
+  max_tokens: 8192
+  multimodal_enabled: true # será automaticamente efetivo como false para esse modelo
+```
+
+Exemplo rápido (Maritaca):
+
+```yaml
+llm:
+  provider: maritaca
+  model_profile: sabiazinho_4
+  api_key_env: MARITACA_API_KEY
+  temperature: 0.7
+  max_tokens: 8192
+  multimodal_enabled: true # será automaticamente efetivo como false (modelo text-to-text)
 ```
 
 ## Execução
@@ -117,6 +163,22 @@ curl -X POST "http://localhost:8000/v1/solve" \
     "problem": "Calcule a derivada de x^3",
     "session_id": "sessao-001",
     "resume": false
+  }'
+```
+
+Exemplo com override por requisição (provider/model):
+
+```bash
+curl -X POST "http://localhost:8000/v1/solve" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "problem": "Calcule a derivada de x^3",
+    "provider": "maritaca",
+    "model_profile": "sabiazinho_4",
+    "model": "sabiazinho-4",
+    "api_key_env": "MARITACA_API_KEY",
+    "temperature": 0.7,
+    "max_tokens": 8192
   }'
 ```
 

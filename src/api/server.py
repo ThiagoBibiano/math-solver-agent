@@ -35,6 +35,13 @@ if FastAPI is not None:
         image_url: Optional[str] = Field(default=None, description="Public URL of an image containing the problem")
         image_base64: Optional[str] = Field(default=None, description="Base64 image payload")
         image_media_type: str = Field(default="image/png", description="Media type used for image_base64")
+        provider: Optional[str] = Field(default=None, description="Override LLM provider (e.g. nvidia, maritaca)")
+        model_profile: Optional[str] = Field(default=None, description="Override configured model profile alias")
+        model: Optional[str] = Field(default=None, description="Override provider model identifier")
+        api_key_env: Optional[str] = Field(default=None, description="Override API key env variable name")
+        temperature: Optional[float] = Field(default=None, description="Override generation temperature")
+        top_p: Optional[float] = Field(default=None, description="Override nucleus sampling")
+        max_tokens: Optional[int] = Field(default=None, description="Override max output tokens")
 
 
     class SolveResponse(BaseModel):
@@ -60,6 +67,13 @@ if FastAPI is not None:
         image_url: Optional[str] = Field(default=None)
         image_base64: Optional[str] = Field(default=None)
         image_media_type: str = Field(default="image/png")
+        provider: Optional[str] = Field(default=None)
+        model_profile: Optional[str] = Field(default=None)
+        model: Optional[str] = Field(default=None)
+        api_key_env: Optional[str] = Field(default=None)
+        temperature: Optional[float] = Field(default=None)
+        top_p: Optional[float] = Field(default=None)
+        max_tokens: Optional[int] = Field(default=None)
 else:
 
     class SolveRequest:  # type: ignore[too-many-ancestors]
@@ -87,6 +101,22 @@ def create_app() -> Any:
     app = FastAPI(title="MathSolverAgent API", version="0.1.0")
     agent = MathSolverAgent()
 
+    def _build_llm_overrides(payload_like: Any) -> Dict[str, Any]:
+        """Builds request-scoped LLM override dictionary.
+
+        Args:
+            payload_like: Request payload object with optional LLM override fields.
+
+        Returns:
+            Dictionary containing only defined LLM override values.
+        """
+        overrides: Dict[str, Any] = {}
+        for key in ("provider", "model_profile", "model", "api_key_env", "temperature", "top_p", "max_tokens"):
+            value = getattr(payload_like, key, None)
+            if value is not None:
+                overrides[key] = value
+        return overrides
+
     @app.get("/health")
     async def health() -> Dict[str, str]:
         return {"status": "ok"}
@@ -103,6 +133,7 @@ def create_app() -> Any:
             image_url=payload.image_url,
             image_base64=payload.image_base64,
             image_media_type=payload.image_media_type,
+            llm_overrides=_build_llm_overrides(payload),
         )
         if state.get("status") == "failed_precondition":
             raise HTTPException(status_code=503, detail="LLM provider unavailable in strict generative mode.")
@@ -132,6 +163,11 @@ def create_app() -> Any:
             image_url = payload.get("image_url")
             image_base64 = payload.get("image_base64")
             image_media_type = payload.get("image_media_type", "image/png")
+            llm_overrides = {
+                key: payload[key]
+                for key in ("provider", "model_profile", "model", "api_key_env", "temperature", "top_p", "max_tokens")
+                if key in payload and payload[key] is not None
+            }
 
             if not problem and not resume and not any([image_path, image_url, image_base64]):
                 raise ValueError("problem or image input is required unless resume=true")
@@ -144,6 +180,7 @@ def create_app() -> Any:
                 image_url=image_url,
                 image_base64=image_base64,
                 image_media_type=image_media_type,
+                llm_overrides=llm_overrides,
             )
 
             for event in state.get("decision_trace", []):
@@ -181,6 +218,7 @@ def create_app() -> Any:
             image_url=payload.image_url,
             image_base64=payload.image_base64,
             image_media_type=payload.image_media_type,
+            llm_overrides=_build_llm_overrides(payload),
         )
         if state.get("status") == "failed_precondition":
             raise HTTPException(status_code=503, detail="LLM provider unavailable in strict generative mode.")
