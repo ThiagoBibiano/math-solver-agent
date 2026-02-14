@@ -14,6 +14,7 @@ Verifique no payload de resposta do agente:
 ### `missing_api_key`
 
 - `NVIDIA_API_KEY` não está definido no processo da API.
+- ou `MARITACA_API_KEY` não está definido quando `provider=maritaca`.
 - confirme no mesmo shell que inicia o servidor.
 
 ### `missing_dependency_langchain_nvidia_ai_endpoints`
@@ -35,5 +36,8 @@ pip install -e .[dev]
 
 - rode API e Streamlit no mesmo virtualenv.
 - mantenha `configs/graph_config.yml` versionado por ambiente.
+- prefira trocar `llm.model_profile` em vez de alterar código para mudar de modelo.
+- para modelos não multimodais (ex.: `deepseek_v3_2`), entrada de imagem é ignorada no payload de inferência.
+- modelos Maritaca (`sabia_4`, `sabiazinho_4`) são text-to-text e não usam entrada multimodal.
 - não armazene chaves em código; use `.env` ou secrets do runtime.
 - monitore diretório de checkpoints (`.checkpoints/`) e limpe periodicamente.
