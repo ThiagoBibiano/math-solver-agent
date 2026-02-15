@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 from src.agents.state import build_initial_state
 from src.nodes.solver import solve_problem
@@ -22,6 +23,17 @@ class SolverTestCase(unittest.TestCase):
 
         self.assertEqual(out["status"], "failed_solving")
         self.assertGreater(len(out.get("errors", [])), 0)
+
+    def test_solver_stores_plot_artifact(self) -> None:
+        state = build_initial_state(problem="plot", session_id="s3", max_iterations=2, timeout_seconds=5)
+        state["tool_call"] = {"name": "plot_function_2d", "args": {"expression": "x", "output_path": "artifacts/p.png"}}
+
+        with patch("src.nodes.solver._TOOL_HANDLERS", {"plot_function_2d": lambda **_: {"ok": True, "result": "artifacts/p.png"}}):
+            out = solve_problem(state)
+
+        self.assertEqual(out["status"], "solved")
+        self.assertEqual(len(out.get("artifacts", [])), 1)
+        self.assertEqual(out["artifacts"][0]["path"], "artifacts/p.png")
 
 
 if __name__ == "__main__":

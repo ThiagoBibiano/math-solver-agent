@@ -7,7 +7,7 @@ import uuid
 from copy import deepcopy
 from concurrent.futures import ThreadPoolExecutor, TimeoutError
 from pathlib import Path
-from typing import Any, Callable, Dict, Optional
+from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, Optional
 
 from src.agents.state import AgentState, build_initial_state
 from src.llm import GenerativeMathClient
@@ -209,6 +209,69 @@ class MathSolverAgent:
         Returns:
             Final agent state for the solve request.
         """
+        state, request_llm_client, graph_runtime = self._prepare_execution(
+            problem=problem,
+            session_id=session_id,
+            resume=resume,
+            image_path=image_path,
+            image_url=image_url,
+            image_base64=image_base64,
+            image_media_type=image_media_type,
+            llm_overrides=llm_overrides,
+        )
+        if state.get("status") in {"failed_precondition", "resume_not_found"}:
+            return state
+
+        if graph_runtime is not None:
+            return self._run_langgraph(state, graph_runtime)
+        return self._run_fallback(state, request_llm_client)
+
+    async def solve_events(
+        self,
+        problem: str,
+        session_id: Optional[str] = None,
+        resume: bool = False,
+        image_path: Optional[str] = None,
+        image_url: Optional[str] = None,
+        image_base64: Optional[str] = None,
+        image_media_type: Optional[str] = None,
+        llm_overrides: Optional[Dict[str, Any]] = None,
+    ) -> AsyncIterator[Dict[str, Any]]:
+        """Runs solve pipeline and streams structured events in real time."""
+        state, request_llm_client, graph_runtime = self._prepare_execution(
+            problem=problem,
+            session_id=session_id,
+            resume=resume,
+            image_path=image_path,
+            image_url=image_url,
+            image_base64=image_base64,
+            image_media_type=image_media_type,
+            llm_overrides=llm_overrides,
+        )
+        if state.get("status") in {"failed_precondition", "resume_not_found"}:
+            yield {"type": "result", "data": self._state_to_public_payload(state)}
+            return
+
+        if graph_runtime is not None:
+            async for event in self._run_langgraph_events(state, graph_runtime):
+                yield event
+            return
+
+        for event in self._run_fallback_events(state, request_llm_client):
+            yield event
+
+    def _prepare_execution(
+        self,
+        problem: str,
+        session_id: Optional[str],
+        resume: bool,
+        image_path: Optional[str],
+        image_url: Optional[str],
+        image_base64: Optional[str],
+        image_media_type: Optional[str],
+        llm_overrides: Optional[Dict[str, Any]],
+    ) -> tuple[AgentState, GenerativeMathClient, Optional[Any]]:
+        """Builds request-scoped state and runtime dependencies."""
         sid = session_id or str(uuid.uuid4())
 
         if resume:
@@ -218,12 +281,20 @@ class MathSolverAgent:
                 state["status"] = "resumed"
             else:
                 state = self._new_state(problem, sid)
+                state["status"] = "resume_not_found"
+                state.setdefault("errors", []).append("No checkpoint found for session '{}'.".format(sid))
+                self.checkpoints.save(state)
         else:
             state = self._new_state(problem, sid)
 
         request_llm_client = self._resolve_request_llm_client(llm_overrides)
         state["prompt_variant"] = select_prompt_variant(self.prompt_config, sid)
         state["llm"] = request_llm_client.describe()
+        state.setdefault("artifacts", [])
+
+        if state.get("status") == "resume_not_found":
+            return state, request_llm_client, None
+
         require_llm = bool(self.config.llm.get("require_available", True))
         if require_llm and not request_llm_client.is_available:
             state["status"] = "failed_precondition"
@@ -231,7 +302,8 @@ class MathSolverAgent:
                 "Generative mode requires an available LLM provider. Check API key and provider dependencies."
             )
             self.checkpoints.save(state)
-            return state
+            return state, request_llm_client, None
+
         if any([image_path, image_url, image_base64]):
             state["visual_input"] = {
                 "image_path": image_path,
@@ -243,12 +315,12 @@ class MathSolverAgent:
             state.setdefault("visual_input", {})
 
         if self._graph is not None and request_llm_client is self.llm_client:
-            return self._run_langgraph(state, self._graph)
+            return state, request_llm_client, self._graph
         if self._graph is not None:
             request_graph = self._build_langgraph(request_llm_client)
             if request_graph is not None:
-                return self._run_langgraph(state, request_graph)
-        return self._run_fallback(state, request_llm_client)
+                return state, request_llm_client, request_graph
+        return state, request_llm_client, None
 
     def _resolve_request_llm_client(self, llm_overrides: Optional[Dict[str, Any]]) -> GenerativeMathClient:
         """Resolves the LLM client for one request.
@@ -263,6 +335,9 @@ class MathSolverAgent:
             return self.llm_client
 
         effective_config = dict(self.config.llm)
+        provider_override = str(llm_overrides.get("provider", "")).strip().lower() if llm_overrides else ""
+        has_provider_or_profile_override = bool(llm_overrides.get("provider") or llm_overrides.get("model_profile"))
+        has_explicit_model_override = bool(llm_overrides.get("model"))
         for key, value in llm_overrides.items():
             if value is None:
                 continue
@@ -274,6 +349,12 @@ class MathSolverAgent:
                     effective_config[key] = merged_mapping
                     continue
             effective_config[key] = value
+        if has_provider_or_profile_override and not has_explicit_model_override:
+            # Avoid stale model inheritance from base config (e.g. nvidia model
+            # kept while provider/profile switches to maritaca).
+            effective_config.pop("model", None)
+        if provider_override and "api_key_env" not in llm_overrides:
+            effective_config["api_key_env"] = "MARITACA_API_KEY" if provider_override == "maritaca" else "NVIDIA_API_KEY"
         return GenerativeMathClient(config=effective_config)
 
     def _new_state(self, problem: str, session_id: str) -> AgentState:
@@ -293,6 +374,32 @@ class MathSolverAgent:
             timeout_seconds=self.config.runtime.default_timeout_seconds,
         )
 
+    def _state_to_public_payload(self, state: AgentState) -> Dict[str, Any]:
+        """Builds API-friendly response payload from full agent state."""
+        return {
+            "session_id": state.get("session_id"),
+            "status": state.get("status"),
+            "domain": state.get("domain"),
+            "strategy": state.get("strategy"),
+            "llm": state.get("llm", {}),
+            "has_visual_input": bool(state.get("visual_input")),
+            "result": state.get("symbolic_result"),
+            "numeric_result": state.get("numeric_result"),
+            "verification": state.get("verification", {}),
+            "explanation": state.get("explanation", ""),
+            "metrics": state.get("metrics", {}),
+            "decision_trace": state.get("decision_trace", []),
+            "artifacts": state.get("artifacts", []),
+        }
+
+    @staticmethod
+    def _stream_explanation_tokens(explanation: str) -> Iterator[str]:
+        """Splits explanation text into lightweight UI-friendly token chunks."""
+        text = str(explanation or "")
+        if not text:
+            return iter(())
+        return (chunk + " " for chunk in text.split())
+
     def _run_langgraph(self, state: AgentState, graph_runtime: Any) -> AgentState:
         """Executes the compiled graph and persists final checkpoint.
 
@@ -306,8 +413,91 @@ class MathSolverAgent:
         config = {"configurable": {"thread_id": state["session_id"]}}
         out = graph_runtime.invoke(state, config=config)
         final_state = AgentState(**out)
+        final_state.setdefault("artifacts", [])
         self.checkpoints.save(final_state)
         return final_state
+
+    async def _run_langgraph_events(self, state: AgentState, graph_runtime: Any) -> AsyncIterator[Dict[str, Any]]:
+        """Streams node and trace updates from LangGraph runtime."""
+        config = {"configurable": {"thread_id": state["session_id"]}}
+        seen_trace_count = len(state.get("decision_trace", []))
+        current_state = AgentState(**deepcopy(dict(state)))
+
+        async for update in self._iter_langgraph_updates(state, graph_runtime, config):
+            for node_name, payload in self._extract_node_payloads(update):
+                yield {"type": "node_status", "data": {"node": node_name, "status": "running"}}
+                merged_payload = deepcopy(dict(current_state))
+                merged_payload.update(payload)
+                current_state = AgentState(**merged_payload)
+                current_state.setdefault("artifacts", [])
+
+                decision_trace = current_state.get("decision_trace", [])
+                for trace_event in decision_trace[seen_trace_count:]:
+                    yield {"type": "trace", "data": trace_event}
+                seen_trace_count = len(decision_trace)
+
+                status = "failed" if str(current_state.get("status", "")).startswith("failed_") else "done"
+                yield {"type": "node_status", "data": {"node": node_name, "status": status}}
+
+        self.checkpoints.save(current_state)
+        for token in self._stream_explanation_tokens(str(current_state.get("explanation", ""))):
+            yield {"type": "token", "data": {"text": token}}
+        yield {"type": "result", "data": self._state_to_public_payload(current_state)}
+
+    async def _iter_langgraph_updates(
+        self,
+        state: AgentState,
+        graph_runtime: Any,
+        config: Dict[str, Any],
+    ) -> AsyncIterator[Any]:
+        """Iterates LangGraph updates preferring async stream APIs."""
+        if hasattr(graph_runtime, "astream"):
+            try:
+                async for item in graph_runtime.astream(state, config=config, stream_mode="updates"):
+                    yield item
+                return
+            except TypeError:
+                async for item in graph_runtime.astream(state, config=config):
+                    yield item
+                return
+
+        if hasattr(graph_runtime, "stream"):
+            try:
+                for item in graph_runtime.stream(state, config=config, stream_mode="updates"):
+                    yield item
+                return
+            except TypeError:
+                for item in graph_runtime.stream(state, config=config):
+                    yield item
+                return
+
+        out = graph_runtime.invoke(state, config=config)
+        yield {"__final__": out}
+
+    @staticmethod
+    def _extract_node_payloads(update: Any) -> Iterable[tuple[str, Dict[str, Any]]]:
+        """Extracts node/state payloads from LangGraph update chunks."""
+        if not isinstance(update, dict):
+            return []
+
+        nodes = ("analyzer", "converter", "solver", "verifier")
+        pairs: list[tuple[str, Dict[str, Any]]] = []
+
+        for node in nodes:
+            payload = update.get(node)
+            if isinstance(payload, dict):
+                pairs.append((node, payload))
+
+        if pairs:
+            return pairs
+
+        if "session_id" in update and "status" in update:
+            return [("verifier", update)]
+
+        maybe_state = update.get("__final__")
+        if isinstance(maybe_state, dict):
+            return [("verifier", maybe_state)]
+        return []
 
     def _run_fallback(self, state: AgentState, llm_client: GenerativeMathClient) -> AgentState:
         """Executes node sequence using threaded node runner fallback.
@@ -376,7 +566,109 @@ class MathSolverAgent:
             if not state.get("should_refine", False):
                 break
 
+        state.setdefault("artifacts", [])
         return state
+
+    def _run_fallback_events(self, state: AgentState, llm_client: GenerativeMathClient) -> Iterable[Dict[str, Any]]:
+        """Streams node and trace updates while executing fallback runtime."""
+        seen_trace_count = len(state.get("decision_trace", []))
+
+        if state.get("status") in {"initialized", "resumed"}:
+            state, seen_trace_count, events = self._run_fallback_node_with_events(
+                state=state,
+                seen_trace_count=seen_trace_count,
+                node_name="analyzer",
+                timeout_key="analysis",
+                fn=lambda st: analyze_problem(
+                    st,
+                    llm_client=llm_client,
+                    prompt_pack=self.prompts.get("analyzer", {}),
+                ),
+            )
+            for event in events:
+                yield event
+            if state.get("status") in {"failed_analysis", "failed_precondition"}:
+                self.checkpoints.save(state)
+                yield {"type": "result", "data": self._state_to_public_payload(state)}
+                return
+
+        while True:
+            state, seen_trace_count, events = self._run_fallback_node_with_events(
+                state=state,
+                seen_trace_count=seen_trace_count,
+                node_name="converter",
+                timeout_key="planning",
+                fn=lambda st: convert_to_tool_syntax(
+                    st,
+                    llm_client=llm_client,
+                    prompt_pack=self.prompts.get("converter", {}),
+                ),
+            )
+            for event in events:
+                yield event
+            if state.get("status") in {"failed_planning", "failed_precondition"}:
+                break
+
+            state, seen_trace_count, events = self._run_fallback_node_with_events(
+                state=state,
+                seen_trace_count=seen_trace_count,
+                node_name="solver",
+                timeout_key="solving",
+                fn=lambda st: solve_problem(
+                    st,
+                    llm_client=llm_client,
+                    prompt_pack=self.prompts.get("solver", {}),
+                ),
+            )
+            for event in events:
+                yield event
+            if state.get("status") == "failed_solving":
+                break
+
+            state, seen_trace_count, events = self._run_fallback_node_with_events(
+                state=state,
+                seen_trace_count=seen_trace_count,
+                node_name="verifier",
+                timeout_key="verification",
+                fn=lambda st: verify_solution(
+                    st,
+                    llm_client=llm_client,
+                    prompt_pack=self.prompts.get("verifier", {}),
+                ),
+            )
+            for event in events:
+                yield event
+            if not state.get("should_refine", False):
+                break
+
+        self.checkpoints.save(state)
+        for token in self._stream_explanation_tokens(str(state.get("explanation", ""))):
+            yield {"type": "token", "data": {"text": token}}
+        yield {"type": "result", "data": self._state_to_public_payload(state)}
+
+    def _run_fallback_node_with_events(
+        self,
+        state: AgentState,
+        seen_trace_count: int,
+        node_name: str,
+        timeout_key: str,
+        fn: Callable[[AgentState], AgentState],
+    ) -> tuple[AgentState, int, list[Dict[str, Any]]]:
+        """Runs one fallback node and returns corresponding stream events."""
+        events: list[Dict[str, Any]] = [{"type": "node_status", "data": {"node": node_name, "status": "running"}}]
+
+        out = self._run_node(timeout_key, fn, state)
+        out.setdefault("artifacts", [])
+        self.checkpoints.save(out)
+
+        decision_trace = out.get("decision_trace", [])
+        for trace_event in decision_trace[seen_trace_count:]:
+            events.append({"type": "trace", "data": trace_event})
+        seen_trace_count = len(decision_trace)
+
+        status = "failed" if str(out.get("status", "")).startswith("failed_") else "done"
+        events.append({"type": "node_status", "data": {"node": node_name, "status": status}})
+        return out, seen_trace_count, events
 
     def _run_node(self, name: str, fn: Callable[[AgentState], AgentState], state: AgentState) -> AgentState:
         """Runs a node function with timeout isolation.
@@ -440,6 +732,7 @@ class MathSolverAgent:
             "verification": state.get("verification"),
             "explanation": state.get("explanation"),
             "metrics": state.get("metrics"),
+            "artifacts": state.get("artifacts", []),
         }
         with output.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=True, indent=2)

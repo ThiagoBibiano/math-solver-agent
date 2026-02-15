@@ -50,6 +50,7 @@ class AgentState(TypedDict, total=False):
     convergence_failures: int
     metrics: Dict[str, float]
     decision_trace: List[DecisionTrace]
+    artifacts: List[Dict[str, Any]]
     created_at: str
     updated_at: str
 
@@ -96,6 +97,7 @@ def build_initial_state(problem: str, session_id: str, max_iterations: int, time
         convergence_failures=0,
         metrics={},
         decision_trace=[],
+        artifacts=[],
         created_at=now,
         updated_at=now,
     )
