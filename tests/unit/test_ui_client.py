@@ -21,6 +21,19 @@ class UIClientTestCase(unittest.TestCase):
     def test_infer_media_type(self) -> None:
         self.assertEqual(infer_image_media_type("figure.jpg"), "image/jpeg")
 
+    def test_build_payload_with_llm_overrides(self) -> None:
+        payload = build_solve_payload(
+            problem="Calcule a derivada de x^3",
+            provider="maritaca",
+            model_profile="sabia_4",
+            temperature=0.7,
+            max_tokens=4096,
+        )
+        self.assertEqual(payload["provider"], "maritaca")
+        self.assertEqual(payload["model_profile"], "sabia_4")
+        self.assertEqual(payload["temperature"], 0.7)
+        self.assertEqual(payload["max_tokens"], 4096)
+
 
 if __name__ == "__main__":
     unittest.main()

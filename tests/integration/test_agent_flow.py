@@ -197,6 +197,110 @@ class AgentFlowIntegrationTestCase(unittest.TestCase):
             self.assertEqual(result.get("llm", {}).get("model"), "sabia-4")
             self.assertEqual(result.get("llm", {}).get("api_key_env"), "MARITACA_API_KEY")
 
+    def test_provider_override_sets_default_api_key_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True, "provider": "nvidia", "model_profile": "kimi_k2_5", "api_key_env": "NVIDIA_API_KEY"},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": False}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(
+                    problem="2+2",
+                    llm_overrides={
+                        "provider": "maritaca",
+                        "model_profile": "sabiazinho_4",
+                    },
+                )
+
+            self.assertEqual(result.get("llm", {}).get("provider"), "maritaca")
+            self.assertEqual(result.get("llm", {}).get("api_key_env"), "MARITACA_API_KEY")
+
+    def test_profile_override_without_explicit_model_uses_profile_model(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={
+                    "require_available": True,
+                    "provider": "nvidia",
+                    "model_profile": "kimi_k2_5",
+                    "model": "moonshotai/kimi-k2.5",
+                },
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": False}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(
+                    problem="2+2",
+                    llm_overrides={
+                        "provider": "maritaca",
+                        "model_profile": "sabiazinho_4",
+                    },
+                )
+
+            self.assertEqual(result.get("llm", {}).get("provider"), "maritaca")
+            self.assertNotEqual(result.get("llm", {}).get("model"), "moonshotai/kimi-k2.5")
+
+    def test_resume_without_checkpoint_returns_resume_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": True, "variants": {"A": {}, "B": {}}}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(problem="", session_id="sessao-ausente", resume=True)
+
+            self.assertEqual(result.get("status"), "resume_not_found")
+            self.assertGreater(len(result.get("errors", [])), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

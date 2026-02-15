@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import mimetypes
 import os
 import re
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
-
 
 try:  # pragma: no cover
     from dotenv import load_dotenv
@@ -193,11 +194,18 @@ class GenerativeMathClient:
             provider_hint=requested_provider or None,
         )
         provider_value = requested_provider or selected_profile.provider
+        api_key_env_value = _resolve_effective_api_key_env(
+            provider=provider_value,
+            configured_env=str(raw.get("api_key_env", "")),
+        )
 
         temperature_value = float(raw.get("temperature", selected_profile.default_temperature))
         top_p_value = float(raw.get("top_p", selected_profile.default_top_p))
         max_tokens_raw = raw.get("max_tokens", raw.get("max_completion_tokens", selected_profile.default_max_tokens))
         max_tokens_value = int(max_tokens_raw)
+        original_max_tokens_value = max_tokens_value
+        if provider_value == "maritaca":
+            max_tokens_value = max(1, min(max_tokens_value, int(selected_profile.default_max_tokens)))
 
         profile_chat_kwargs = dict(selected_profile.chat_template_kwargs)
         explicit_chat_kwargs = raw.get("chat_template_kwargs")
@@ -208,13 +216,18 @@ class GenerativeMathClient:
 
         multimodal_enabled = bool(raw.get("multimodal_enabled", True)) and selected_profile.multimodal
 
+        temperature_effective = temperature_value
+        if provider_value == "maritaca":
+            # ChatMaritalk requires 0.0 < temperature < 1.0.
+            temperature_effective = min(max(temperature_value, 0.01), 0.99)
+
         self.config = LLMRuntimeConfig(
             enabled=bool(raw.get("enabled", True)),
             provider=provider_value,
             model=selected_profile.model,
             model_profile=selected_profile.alias,
-            api_key_env=str(raw.get("api_key_env", _default_api_key_env(provider_value))),
-            temperature=temperature_value,
+            api_key_env=api_key_env_value,
+            temperature=temperature_effective,
             top_p=top_p_value,
             max_tokens=max_tokens_value,
             thinking=bool(raw.get("thinking", True)),
@@ -224,9 +237,17 @@ class GenerativeMathClient:
             max_image_bytes=int(raw.get("max_image_bytes", 5242880)),
         )
         self.model_profile = selected_profile
+        self.logger = logging.getLogger("math_solver_agent.llm")
 
         self._client: Optional[Any] = None
         self._unavailable_reason: Optional[str] = None
+        if provider_value == "maritaca" and max_tokens_value != original_max_tokens_value:
+            self.logger.info(
+                "maritaca_max_tokens_clamped requested=%s effective=%s profile=%s",
+                original_max_tokens_value,
+                max_tokens_value,
+                selected_profile.alias,
+            )
         self._bootstrap()
 
     @property
@@ -285,13 +306,13 @@ class GenerativeMathClient:
                 temperature=self.config.temperature,
                 top_p=self.config.top_p,
                 max_tokens=self.config.max_tokens,
-                extra_body=self._extra_body(),
             )
             return
 
         if ChatMaritalk is None:
             self._unavailable_reason = "missing_dependency_langchain_community"
             return
+        self.logger.info("maritaca_client_adapter=langchain_community")
         self._client = ChatMaritalk(
             model=self.config.model,
             api_key=api_key,
@@ -368,9 +389,36 @@ class GenerativeMathClient:
             multimodal_enabled=self.config.multimodal_enabled,
             max_image_bytes=self.config.max_image_bytes,
         )
-        response = self._client.invoke(
-            messages,
-            **self._invocation_kwargs(),
+        started_at = time.perf_counter()
+        self.logger.info(
+            "llm_invoke_start provider=%s model=%s profile=%s api_key_env=%s multimodal=%s",
+            self.config.provider,
+            self.config.model,
+            self.config.model_profile,
+            self.config.api_key_env,
+            bool(image_input),
+        )
+        try:
+            response = self._client.invoke(
+                messages,
+                **self._invocation_kwargs(),
+            )
+        except Exception as exc:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            self.logger.exception(
+                "llm_invoke_failed provider=%s model=%s elapsed_ms=%.1f error=%s",
+                self.config.provider,
+                self.config.model,
+                elapsed_ms,
+                exc,
+            )
+            raise
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        self.logger.info(
+            "llm_invoke_done provider=%s model=%s elapsed_ms=%.1f",
+            self.config.provider,
+            self.config.model,
+            elapsed_ms,
         )
         return str(getattr(response, "content", "") or "")
 
@@ -388,21 +436,6 @@ class GenerativeMathClient:
         if not chat_kwargs:
             return {}
         return {"extra_body": {"chat_template_kwargs": chat_kwargs}}
-
-    def _extra_body(self) -> Dict[str, Any]:
-        """Builds constructor extra_body for provider-specific options.
-
-        Returns:
-            Extra body dictionary used during client construction.
-        """
-        chat_kwargs = self.config.chat_template_kwargs
-        if self.config.provider != "nvidia":
-            return {}
-        if not chat_kwargs and self.config.thinking:
-            chat_kwargs = {"thinking": True}
-        if not chat_kwargs:
-            return {}
-        return {"chat_template_kwargs": chat_kwargs}
 
     def invoke_json(
         self,
@@ -554,7 +587,7 @@ class GenerativeMathClient:
             "\"plan\": string[], "
             "\"tool_call\": {{\"name\": string, \"args\": object}}}}. "
             "Ferramentas permitidas: differentiate_expression, integrate_expression, solve_equation, "
-            "simplify_expression, evaluate_expression, numerical_integration, solve_ode. "
+            "simplify_expression, evaluate_expression, numerical_integration, solve_ode, plot_function_2d. "
             "Nao inclua texto fora do JSON. "
             "Iteracao={{iteration}} HasImage={{has_image}} Problem={{problem}} Analysis={{analysis}}"
         )
@@ -593,7 +626,9 @@ class GenerativeMathClient:
         )
         default_user = (
             "Gere uma explicação pedagógica em PT-BR com passos, teoremas aplicados, alertas de erros comuns "
-            "e interpretação intuitiva. Contexto JSON: {{state_summary}}"
+            "e interpretação intuitiva. Use $...$ para fórmulas inline e $$...$$ para fórmulas em bloco. "
+            "Nao emita simbolos unicode matematicos diretos (ex.: '·'); use comandos LaTeX equivalentes (ex.: '\\cdot'). "
+            "Contexto JSON: {{state_summary}}"
         )
         user_template = (prompt_pack or {}).get("user", default_user)
         user = _render_prompt_template(user_template, {"state_summary": state_summary})
@@ -916,6 +951,31 @@ def _default_api_key_env(provider: str) -> str:
     if provider == "maritaca":
         return "MARITACA_API_KEY"
     return "NVIDIA_API_KEY"
+
+
+def _resolve_effective_api_key_env(provider: str, configured_env: str) -> str:
+    """Resolves API key env with provider-aware safety against stale defaults.
+
+    Args:
+        provider: Target provider name.
+        configured_env: Env name received from runtime config.
+
+    Returns:
+        Effective environment variable name to resolve key from.
+    """
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_env = str(configured_env or "").strip()
+    default_env = _default_api_key_env(normalized_provider)
+    if not normalized_env:
+        return default_env
+
+    # When provider is overridden per request, inherited defaults from another
+    # provider can leak through merged config and cause 401 invalid_api_key.
+    if normalized_provider == "maritaca" and normalized_env in {"NVIDIA_API_KEY", "nvidia_api_key"}:
+        return default_env
+    if normalized_provider == "nvidia" and normalized_env in {"MARITACA_API_KEY", "maritaca_api_key"}:
+        return default_env
+    return normalized_env
 
 
 def _load_environment_variables() -> None:

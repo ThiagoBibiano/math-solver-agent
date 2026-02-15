@@ -37,6 +37,7 @@ math_solver_agent/
 │   │   └── utils.py
 │   ├── ui/
 │   │   ├── api_client.py
+│   │   ├── chainlit_app.py
 │   │   └── streamlit_app.py
 │   └── main.py
 ├── tests/
@@ -175,12 +176,12 @@ curl -X POST "http://localhost:8000/v1/solve" \
     "problem": "Calcule a derivada de x^3",
     "provider": "maritaca",
     "model_profile": "sabiazinho_4",
-    "model": "sabiazinho-4",
-    "api_key_env": "MARITACA_API_KEY",
     "temperature": 0.7,
     "max_tokens": 8192
   }'
 ```
+
+Observação: a API resolve automaticamente `api_key_env` com base no `provider` quando esse campo não é enviado.
 
 Exemplo multimodal (`image_url`):
 
@@ -214,6 +215,49 @@ A UI permite:
 - enviar somente imagem;
 - enviar texto + imagem;
 - escrever o enunciado em Markdown/LaTeX.
+
+### UI Chainlit (chat de agentes)
+
+Terminal 1 (API):
+
+```bash
+python3 -m src.main --mode api --host 0.0.0.0 --port 8001
+```
+
+Terminal 2 (UI):
+
+```bash
+chainlit run src/ui/chainlit_app.py -w
+```
+
+No Chainlit, mantenha `API Base URL` apontando para a API FastAPI (padrao: `http://localhost:8001`).
+
+`timeout_seconds` na UI Chainlit vai de `60` a `1000` segundos (padrao `300`).
+A lista de `model_profile` exibe todos os perfis do `graph_config.yml`; a combinacao efetiva `provider/profile` e validada no backend.
+
+Para debug do frontend Chainlit, ajuste o nivel de log:
+
+```bash
+MATH_SOLVER_UI_LOG_LEVEL=INFO chainlit run src/ui/chainlit_app.py -w
+```
+
+Os logs exibem `request_id`, URL da API, tempo de chamada e status, ajudando a identificar onde ocorre timeout.
+
+Se o Chainlit reclamar que `.chainlit/config.toml` esta desatualizado, remova a pasta local e rode novamente:
+
+```bash
+rm -rf .chainlit
+chainlit run src/ui/chainlit_app.py -w
+```
+
+A UI Chainlit permite:
+
+- chat estilo assistente com render de Markdown/LaTeX;
+- upload de imagem (PNG/JPG) pelo clipe na caixa de mensagem;
+- seleção de `provider`, `model_profile`, `temperature`, `max_tokens` e `session_id`;
+- exibição de `decision_trace` antes da resposta final;
+- comando `/resume` para retomar checkpoint da sessão ativa.
+- envio de overrides para `/v1/solve` sem precisar informar `api_key_env` (resolvido pelo backend).
 
 ## Modo estrito generativo
 

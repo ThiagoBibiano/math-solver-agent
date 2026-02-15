@@ -9,11 +9,12 @@ from src.utils.exporters import export_latex, export_notebook
 from src.utils.logger import get_logger
 
 try:  # pragma: no cover
-    from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
     from pydantic import BaseModel, Field
 except ImportError:  # pragma: no cover
     FastAPI = None  # type: ignore[assignment]
     HTTPException = Exception  # type: ignore[assignment]
+    Request = Any  # type: ignore[misc,assignment]
     WebSocket = Any  # type: ignore[misc,assignment]
     WebSocketDisconnect = Exception  # type: ignore[assignment]
     BaseModel = object  # type: ignore[assignment]
@@ -56,6 +57,8 @@ if FastAPI is not None:
         verification: Dict[str, Any]
         explanation: str
         metrics: Dict[str, float]
+        decision_trace: list[Dict[str, Any]]
+        artifacts: list[Dict[str, Any]]
 
 
     class ExportRequest(BaseModel):
@@ -117,26 +120,7 @@ def create_app() -> Any:
                 overrides[key] = value
         return overrides
 
-    @app.get("/health")
-    async def health() -> Dict[str, str]:
-        return {"status": "ok"}
-
-    @app.post("/v1/solve", response_model=SolveResponse)
-    async def solve(payload: SolveRequest) -> Dict[str, Any]:
-        if not payload.problem and not payload.resume and not any([payload.image_path, payload.image_url, payload.image_base64]):
-            raise HTTPException(status_code=422, detail="problem or image input is required unless resume=true")
-        state = agent.solve(
-            problem=payload.problem,
-            session_id=payload.session_id,
-            resume=payload.resume,
-            image_path=payload.image_path,
-            image_url=payload.image_url,
-            image_base64=payload.image_base64,
-            image_media_type=payload.image_media_type,
-            llm_overrides=_build_llm_overrides(payload),
-        )
-        if state.get("status") == "failed_precondition":
-            raise HTTPException(status_code=503, detail="LLM provider unavailable in strict generative mode.")
+    def _state_to_response(state: Dict[str, Any]) -> Dict[str, Any]:
         return {
             "session_id": state.get("session_id"),
             "status": state.get("status"),
@@ -149,7 +133,52 @@ def create_app() -> Any:
             "verification": state.get("verification", {}),
             "explanation": state.get("explanation", ""),
             "metrics": state.get("metrics", {}),
+            "decision_trace": state.get("decision_trace", []),
+            "artifacts": state.get("artifacts", []),
         }
+
+    @app.get("/health")
+    async def health() -> Dict[str, str]:
+        return {"status": "ok"}
+
+    @app.post("/v1/solve", response_model=SolveResponse)
+    async def solve(payload: SolveRequest, request: Request) -> Dict[str, Any]:
+        request_id = request.headers.get("X-Request-ID", "-")
+        logger.info(
+            "solve_start request_id=%s provider=%s model_profile=%s has_problem=%s has_image=%s session_id=%s",
+            request_id,
+            payload.provider,
+            payload.model_profile,
+            bool(payload.problem),
+            bool(payload.image_path or payload.image_url or payload.image_base64),
+            payload.session_id,
+        )
+        if not payload.problem and not payload.resume and not any([payload.image_path, payload.image_url, payload.image_base64]):
+            raise HTTPException(status_code=422, detail="problem or image input is required unless resume=true")
+        try:
+            state = agent.solve(
+                problem=payload.problem,
+                session_id=payload.session_id,
+                resume=payload.resume,
+                image_path=payload.image_path,
+                image_url=payload.image_url,
+                image_base64=payload.image_base64,
+                image_media_type=payload.image_media_type,
+                llm_overrides=_build_llm_overrides(payload),
+            )
+        except Exception as exc:
+            logger.exception("solve_failed request_id=%s error=%s", request_id, exc)
+            raise HTTPException(status_code=502, detail="Provider call failed: {}".format(exc)) from exc
+        if state.get("status") == "failed_precondition":
+            raise HTTPException(status_code=503, detail="LLM provider unavailable in strict generative mode.")
+        logger.info(
+            "solve_done request_id=%s status=%s model=%s session_id=%s",
+            request_id,
+            state.get("status"),
+            state.get("llm", {}).get("model"),
+            state.get("session_id"),
+        )
+        return _state_to_response(state)
 
     @app.websocket("/v1/solve/stream")
     async def solve_stream(ws: WebSocket) -> None:
@@ -172,7 +201,7 @@ def create_app() -> Any:
             if not problem and not resume and not any([image_path, image_url, image_base64]):
                 raise ValueError("problem or image input is required unless resume=true")
 
-            state = agent.solve(
+            async for event in agent.solve_events(
                 problem=problem,
                 session_id=session_id,
                 resume=resume,
@@ -181,24 +210,10 @@ def create_app() -> Any:
                 image_base64=image_base64,
                 image_media_type=image_media_type,
                 llm_overrides=llm_overrides,
-            )
+            ):
+                await ws.send_json(event)
 
-            for event in state.get("decision_trace", []):
-                await ws.send_json({"type": "trace", "data": event})
-
-            await ws.send_json(
-                {
-                    "type": "result",
-                    "data": {
-                        "session_id": state.get("session_id"),
-                        "status": state.get("status"),
-                        "llm": state.get("llm", {}),
-                        "has_visual_input": bool(state.get("visual_input")),
-                        "result": state.get("symbolic_result"),
-                        "verification": state.get("verification", {}),
-                    },
-                }
-            )
+            await ws.send_json({"type": "done"})
             await ws.close(code=1000)
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected by client")

@@ -16,6 +16,7 @@ from src.tools.calculator import (
     solve_equation,
     solve_ode,
 )
+from src.tools.plotter import plot_function_2d
 
 
 _TOOL_HANDLERS: Dict[str, Callable[..., Dict[str, Any]]] = {
@@ -26,6 +27,7 @@ _TOOL_HANDLERS: Dict[str, Callable[..., Dict[str, Any]]] = {
     "evaluate_expression": evaluate_expression,
     "numerical_integration": numerical_integration,
     "solve_ode": solve_ode,
+    "plot_function_2d": plot_function_2d,
 }
 
 
@@ -66,6 +68,18 @@ def solve_problem(
     state["tool_result"] = result
     state["symbolic_result"] = _result_to_text(result)
     state["numeric_result"] = _try_extract_numeric_result(result)
+    state.setdefault("artifacts", [])
+    if tool_name == "plot_function_2d" and result.get("ok"):
+        output_path = str(result.get("result", "")).strip()
+        if output_path:
+            state["artifacts"].append(
+                {
+                    "type": "image",
+                    "path": output_path,
+                    "source_tool": "plot_function_2d",
+                    "label": "Grafico gerado",
+                }
+            )
     state["status"] = "solved"
 
     if not result.get("ok"):
