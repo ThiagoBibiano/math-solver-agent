@@ -58,6 +58,7 @@ if FastAPI is not None:
         explanation: str
         metrics: Dict[str, float]
         decision_trace: list[Dict[str, Any]]
+        artifacts: list[Dict[str, Any]]
 
 
     class ExportRequest(BaseModel):
@@ -119,6 +120,23 @@ def create_app() -> Any:
                 overrides[key] = value
         return overrides
 
+    def _state_to_response(state: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "session_id": state.get("session_id"),
+            "status": state.get("status"),
+            "domain": state.get("domain"),
+            "strategy": state.get("strategy"),
+            "llm": state.get("llm", {}),
+            "has_visual_input": bool(state.get("visual_input")),
+            "result": state.get("symbolic_result"),
+            "numeric_result": state.get("numeric_result"),
+            "verification": state.get("verification", {}),
+            "explanation": state.get("explanation", ""),
+            "metrics": state.get("metrics", {}),
+            "decision_trace": state.get("decision_trace", []),
+            "artifacts": state.get("artifacts", []),
+        }
+
     @app.get("/health")
     async def health() -> Dict[str, str]:
         return {"status": "ok"}
@@ -160,20 +178,7 @@ def create_app() -> Any:
             state.get("llm", {}).get("model"),
             state.get("session_id"),
         )
-        return {
-            "session_id": state.get("session_id"),
-            "status": state.get("status"),
-            "domain": state.get("domain"),
-            "strategy": state.get("strategy"),
-            "llm": state.get("llm", {}),
-            "has_visual_input": bool(state.get("visual_input")),
-            "result": state.get("symbolic_result"),
-            "numeric_result": state.get("numeric_result"),
-            "verification": state.get("verification", {}),
-            "explanation": state.get("explanation", ""),
-            "metrics": state.get("metrics", {}),
-            "decision_trace": state.get("decision_trace", []),
-        }
+        return _state_to_response(state)
 
     @app.websocket("/v1/solve/stream")
     async def solve_stream(ws: WebSocket) -> None:
@@ -196,7 +201,7 @@ def create_app() -> Any:
             if not problem and not resume and not any([image_path, image_url, image_base64]):
                 raise ValueError("problem or image input is required unless resume=true")
 
-            state = agent.solve(
+            async for event in agent.solve_events(
                 problem=problem,
                 session_id=session_id,
                 resume=resume,
@@ -205,24 +210,10 @@ def create_app() -> Any:
                 image_base64=image_base64,
                 image_media_type=image_media_type,
                 llm_overrides=llm_overrides,
-            )
+            ):
+                await ws.send_json(event)
 
-            for event in state.get("decision_trace", []):
-                await ws.send_json({"type": "trace", "data": event})
-
-            await ws.send_json(
-                {
-                    "type": "result",
-                    "data": {
-                        "session_id": state.get("session_id"),
-                        "status": state.get("status"),
-                        "llm": state.get("llm", {}),
-                        "has_visual_input": bool(state.get("visual_input")),
-                        "result": state.get("symbolic_result"),
-                        "verification": state.get("verification", {}),
-                    },
-                }
-            )
+            await ws.send_json({"type": "done"})
             await ws.close(code=1000)
         except WebSocketDisconnect:
             logger.info("WebSocket disconnected by client")

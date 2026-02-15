@@ -17,6 +17,7 @@ _ALLOWED_TOOLS = {
     "evaluate_expression",
     "numerical_integration",
     "solve_ode",
+    "plot_function_2d",
 }
 
 _TOOL_ALIASES = {
@@ -30,6 +31,7 @@ _TOOL_ALIASES = {
     "evaluate": "evaluate_expression",
     "numeric_integration": "numerical_integration",
     "ode": "solve_ode",
+    "plot": "plot_function_2d",
 }
 
 

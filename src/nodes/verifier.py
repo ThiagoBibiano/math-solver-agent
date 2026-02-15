@@ -60,6 +60,23 @@ def _signature(state: AgentState) -> str:
     )
 
 
+def _normalize_latex_delimiters(text: str) -> str:
+    """Normalizes LaTeX delimiters to dollar style expected by UI.
+
+    Converts:
+    - `\\( ... \\)` -> `$ ... $`
+    - `\\[ ... \\]` -> `$$ ... $$`
+    """
+    if not text:
+        return ""
+
+    normalized = str(text)
+    normalized = normalized.replace("·", r" \cdot ")
+    normalized = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", normalized, flags=re.DOTALL)
+    normalized = re.sub(r"\\\((.*?)\\\)", r"$\1$", normalized, flags=re.DOTALL)
+    return normalized
+
+
 def verify_solution(
     state: AgentState,
     llm_client: Optional[GenerativeMathClient] = None,
@@ -132,7 +149,7 @@ def verify_solution(
     if notes:
         explanation_lines.append("Observações: {}".format(" ".join(notes)))
 
-    deterministic_explanation = "\n".join(explanation_lines)
+    deterministic_explanation = _normalize_latex_delimiters("\n".join(explanation_lines))
     state["explanation"] = deterministic_explanation
 
     if llm_client is not None and llm_client.is_available:
@@ -149,7 +166,7 @@ def verify_solution(
             prompt_pack=prompt_pack,
         )
         if ai_explanation:
-            state["explanation"] = ai_explanation
+            state["explanation"] = _normalize_latex_delimiters(ai_explanation)
 
     elapsed = time.perf_counter() - started
     metrics = state.setdefault("metrics", {})

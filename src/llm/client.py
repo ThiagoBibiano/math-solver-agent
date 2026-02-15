@@ -587,7 +587,7 @@ class GenerativeMathClient:
             "\"plan\": string[], "
             "\"tool_call\": {{\"name\": string, \"args\": object}}}}. "
             "Ferramentas permitidas: differentiate_expression, integrate_expression, solve_equation, "
-            "simplify_expression, evaluate_expression, numerical_integration, solve_ode. "
+            "simplify_expression, evaluate_expression, numerical_integration, solve_ode, plot_function_2d. "
             "Nao inclua texto fora do JSON. "
             "Iteracao={{iteration}} HasImage={{has_image}} Problem={{problem}} Analysis={{analysis}}"
         )
@@ -626,7 +626,9 @@ class GenerativeMathClient:
         )
         default_user = (
             "Gere uma explicação pedagógica em PT-BR com passos, teoremas aplicados, alertas de erros comuns "
-            "e interpretação intuitiva. Contexto JSON: {{state_summary}}"
+            "e interpretação intuitiva. Use $...$ para fórmulas inline e $$...$$ para fórmulas em bloco. "
+            "Nao emita simbolos unicode matematicos diretos (ex.: '·'); use comandos LaTeX equivalentes (ex.: '\\cdot'). "
+            "Contexto JSON: {{state_summary}}"
         )
         user_template = (prompt_pack or {}).get("user", default_user)
         user = _render_prompt_template(user_template, {"state_summary": state_summary})

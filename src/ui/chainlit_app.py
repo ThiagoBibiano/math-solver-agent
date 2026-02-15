@@ -15,13 +15,13 @@ import chainlit as cl
 from chainlit.input_widget import Select, Slider, TextInput
 
 try:
-    from src.ui.api_client import build_solve_payload, call_solve_api_async, infer_image_media_type
+    from src.ui.api_client import build_solve_payload, call_solve_api_async, infer_image_media_type, stream_solve_api_async
     from src.utils import load_graph_config
 except ModuleNotFoundError:
     project_root = Path(__file__).resolve().parents[2]
     if str(project_root) not in sys.path:
         sys.path.insert(0, str(project_root))
-    from src.ui.api_client import build_solve_payload, call_solve_api_async, infer_image_media_type
+    from src.ui.api_client import build_solve_payload, call_solve_api_async, infer_image_media_type, stream_solve_api_async
     from src.utils import load_graph_config
 
 
@@ -254,7 +254,23 @@ def _format_trace_content(event: Dict[str, Any]) -> str:
         lines.append("Timestamp: `{}`".format(timestamp))
     return "\n\n".join(lines)
 
-def _format_final_response(response: Dict[str, Any]) -> str:
+
+def _resolve_chainlit_thread_id() -> Optional[str]:
+    try:
+        context_var = getattr(getattr(cl, "context", None), "context_var", None)
+        if context_var is None:
+            return None
+        current = context_var.get()
+        session = getattr(current, "session", None)
+        thread_id = getattr(session, "thread_id", None)
+        if thread_id is not None:
+            return str(thread_id)
+    except Exception:  # pragma: no cover - runtime fallback
+        return None
+    return None
+
+
+def _format_final_response(response: Dict[str, Any], include_explanation: bool = True) -> str:
     status = response.get("status", "-")
     session_id = response.get("session_id", "-")
     domain = response.get("domain", "-")
@@ -275,9 +291,7 @@ def _format_final_response(response: Dict[str, Any]) -> str:
         "- **Model:** `{}`".format(llm_info.get("model", "-")),
         "",
         "#### Resultado simbolico",
-        "```text",
-        "{}".format(result or "Sem resultado simbolico."),
-        "```",
+        "{}".format(result or "_Sem resultado simbolico._"),
     ]
 
     if numeric_result is not None:
@@ -286,8 +300,11 @@ def _format_final_response(response: Dict[str, Any]) -> str:
     if isinstance(verification, dict) and verification:
         blocks.extend(["", "#### Verificacao", "```json", json.dumps(verification, ensure_ascii=False, indent=2), "```"])
 
-    blocks.extend(["", "#### Explicacao"])
-    blocks.append(explanation or "_Sem explicacao retornada._")
+    if include_explanation:
+        blocks.extend(["", "#### Explicacao"])
+        blocks.append(explanation or "_Sem explicacao retornada._")
+    else:
+        blocks.extend(["", "_Explicacao exibida em streaming acima._"])
 
     return "\n".join(blocks)
 
@@ -300,18 +317,51 @@ def _friendly_error_message(raw_error: str) -> str:
         return "A API rejeitou a requisicao (422). Envie texto, imagem, ou use `/resume` com session_id valido."
     if "API error 405" in text:
         return "A URL configurada nao aponta para a API do MathSolverAgent. Confira `API Base URL` (ex.: http://localhost:8001)."
+    if "stream da API" in text:
+        return "Nao foi possivel conectar no streaming da API. Confira URL/porta e se o endpoint WebSocket esta ativo."
     if "Nao foi possivel conectar na API" in text:
         return "Nao foi possivel conectar na API. Confira a URL da API e se o servidor esta em execucao."
     return text
 
 
+async def _auto_resume_from_thread(settings: Dict[str, Any], request_id: str) -> Optional[Dict[str, Any]]:
+    """Attempts checkpoint resume based on Chainlit thread id."""
+    thread_id = _resolve_chainlit_thread_id()
+    if not thread_id:
+        return None
+
+    payload = build_solve_payload(
+        problem="",
+        session_id=thread_id,
+        resume=True,
+        provider=settings.get("provider"),
+        model_profile=settings.get("model_profile"),
+        temperature=settings.get("temperature"),
+        max_tokens=settings.get("max_tokens"),
+    )
+    response: Optional[Dict[str, Any]] = None
+    async for event in stream_solve_api_async(
+        base_url=settings["api_url"],
+        payload=payload,
+        timeout_seconds=settings["timeout_seconds"],
+        request_id=request_id,
+    ):
+        if event.get("type") == "result" and isinstance(event.get("data"), dict):
+            response = event["data"]
+        if event.get("type") == "error":
+            raise RuntimeError(str(event.get("message", "Falha no stream de retomada.")))
+    return response
+
+
 @cl.on_chat_start
 async def on_chat_start() -> None:
+    request_id = str(uuid.uuid4())[:8]
     settings = await cl.ChatSettings(_chat_settings_widgets()).send()
     normalized = _normalize_settings(settings)
     cl.user_session.set(SESSION_SETTINGS_KEY, normalized)
     cl.user_session.set(SESSION_HISTORY_KEY, [])
-    cl.user_session.set(SESSION_ACTIVE_ID_KEY, normalized.get("session_id"))
+    thread_id = _resolve_chainlit_thread_id()
+    cl.user_session.set(SESSION_ACTIVE_ID_KEY, thread_id or normalized.get("session_id"))
     logger.info(
         "chat_start api_url=%s provider=%s model_profile=%s timeout=%ss",
         normalized.get("api_url"),
@@ -328,6 +378,22 @@ async def on_chat_start() -> None:
             "- Use `/resume` para retomar checkpoint da `session_id` configurada."
         )
     ).send()
+
+    if thread_id:
+        try:
+            resumed_response = await _auto_resume_from_thread(normalized, request_id=request_id)
+        except Exception as exc:  # pragma: no cover - runtime path
+            logger.warning("auto_resume_failed request_id=%s error=%s", request_id, exc)
+            return
+
+        if not isinstance(resumed_response, dict):
+            return
+        status = str(resumed_response.get("status", ""))
+        cl.user_session.set(SESSION_ACTIVE_ID_KEY, resumed_response.get("session_id") or thread_id)
+        if status == "resume_not_found":
+            logger.info("auto_resume_not_found thread_id=%s", thread_id)
+            return
+        await cl.Message(content="Contexto retomado automaticamente da sessao anterior desta conversa.").send()
 
 
 @cl.on_settings_update
@@ -353,8 +419,9 @@ async def on_message(message: cl.Message) -> None:
     request_id = str(uuid.uuid4())[:8]
     started_at = time.perf_counter()
     settings = _normalize_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
+    thread_id = _resolve_chainlit_thread_id()
     active_session_id = cl.user_session.get(SESSION_ACTIVE_ID_KEY)
-    session_id = settings.get("session_id") or active_session_id
+    session_id = thread_id or settings.get("session_id") or active_session_id
 
     raw_content = (message.content or "").strip()
     resume = raw_content.lower() in {"/resume", "resume"}
@@ -398,33 +465,89 @@ async def on_message(message: cl.Message) -> None:
         await cl.Message(content=str(exc)).send()
         return
 
-    progress = cl.Message(content="Enviando requisicao para API...")
+    progress = cl.Message(content="Conectando no stream da API...")
     await progress.send()
 
+    response: Dict[str, Any] = {}
+    has_streamed_tokens = False
+    used_rest_fallback = False
+    explanation_stream: Optional[cl.Message] = None
+
     try:
-        async with cl.Step(name="api_call", type="tool") as step:
-            step.output = "POST {}/v1/solve (request_id={})".format(settings["api_url"].rstrip("/"), request_id)
-            response = await call_solve_api_async(
-                base_url=settings["api_url"],
-                payload=payload,
-                timeout_seconds=settings["timeout_seconds"],
-                request_id=request_id,
-            )
+        async with cl.Step(name="api_stream", type="tool") as step:
+            step.output = "WS {}/v1/solve/stream (request_id={})".format(settings["api_url"].rstrip("/"), request_id)
+            try:
+                async for event in stream_solve_api_async(
+                    base_url=settings["api_url"],
+                    payload=payload,
+                    timeout_seconds=settings["timeout_seconds"],
+                    request_id=request_id,
+                ):
+                    event_type = str(event.get("type", "")).strip().lower()
+                    data = event.get("data", {})
+                    if event_type == "node_status" and isinstance(data, dict):
+                        node = str(data.get("node", "step")).strip() or "step"
+                        status = str(data.get("status", "pending")).strip() or "pending"
+                        async with cl.Step(name=node, type="tool") as node_step:
+                            node_step.output = "Status: `{}`".format(status)
+                        continue
+                    if event_type == "trace" and isinstance(data, dict):
+                        node = str(data.get("node", "step")).strip() or "step"
+                        async with cl.Step(name="trace - {}".format(node), type="tool") as trace_step:
+                            trace_step.output = _format_trace_content(data)
+                        continue
+                    if event_type == "token" and isinstance(data, dict):
+                        token = str(data.get("text", ""))
+                        if token:
+                            if explanation_stream is None:
+                                explanation_stream = cl.Message(content="### Explicacao\n")
+                                await explanation_stream.send()
+                            await explanation_stream.stream_token(token)
+                            has_streamed_tokens = True
+                        continue
+                    if event_type == "result" and isinstance(data, dict):
+                        response = data
+                        continue
+                    if event_type == "error":
+                        raise RuntimeError(str(event.get("message", "Falha no streaming da API.")))
+                    if event_type == "done":
+                        break
+            except RuntimeError as exc:
+                if "websockets is required for streaming API calls" not in str(exc):
+                    raise
+                used_rest_fallback = True
+                step.output = (
+                    "Dependencia `websockets` ausente. Fallback para POST /v1/solve (request_id={})".format(request_id)
+                )
+                logger.warning("stream_dependency_missing request_id=%s fallback=rest", request_id)
+                response = await call_solve_api_async(
+                    base_url=settings["api_url"],
+                    payload=payload,
+                    timeout_seconds=settings["timeout_seconds"],
+                    request_id=request_id,
+                )
+
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-            step.output = "Sucesso em {:.1f} ms (request_id={})".format(elapsed_ms, request_id)
-            logger.info(
-                "request_success request_id=%s elapsed_ms=%.1f status=%s response_keys=%s",
-                request_id,
-                elapsed_ms,
-                response.get("status"),
-                sorted(response.keys()) if isinstance(response, dict) else [],
-            )
+            if used_rest_fallback:
+                step.output = "Fallback REST concluido em {:.1f} ms (request_id={})".format(elapsed_ms, request_id)
+            else:
+                step.output = "Stream concluido em {:.1f} ms (request_id={})".format(elapsed_ms, request_id)
+            logger.info("stream_success request_id=%s elapsed_ms=%.1f status=%s", request_id, elapsed_ms, response.get("status"))
     except Exception as exc:  # pragma: no cover - runtime path
         elapsed_ms = (time.perf_counter() - started_at) * 1000.0
-        logger.error("request_failed request_id=%s elapsed_ms=%.1f error=%s", request_id, elapsed_ms, exc)
-        progress.content = "Falha ao consultar API (request_id={}).".format(request_id)
+        logger.error("stream_failed request_id=%s elapsed_ms=%.1f error=%s", request_id, elapsed_ms, exc)
+        progress.content = "Falha no stream da API (request_id={}).".format(request_id)
         await progress.update()
         await cl.Message(content=_friendly_error_message(str(exc))).send()
+        return
+
+    if explanation_stream is not None:
+        await explanation_stream.update()
+
+    if not response:
+        progress.content = "A API nao retornou resultado final (request_id={}).".format(request_id)
+        await progress.update()
+        await cl.Message(content="Nao foi possivel concluir a resposta da API.").send()
         return
 
     progress.content = "Resposta recebida da API (request_id={}).".format(request_id)
@@ -433,17 +556,27 @@ async def on_message(message: cl.Message) -> None:
     resolved_session = response.get("session_id") or session_id
     cl.user_session.set(SESSION_ACTIVE_ID_KEY, resolved_session)
 
+    if str(response.get("status", "")).strip().lower() == "resume_not_found":
+        await cl.Message(
+            content=(
+                "Nao existe checkpoint para esta sessao.\n\n"
+                "Defina um `session_id` valido ou envie um novo enunciado para iniciar uma sessao."
+            )
+        ).send()
+        return
+
     history = list(cl.user_session.get(SESSION_HISTORY_KEY) or [])
     history.append({"request": payload, "response": response})
     cl.user_session.set(SESSION_HISTORY_KEY, history)
 
-    trace = response.get("decision_trace", [])
-    if isinstance(trace, list):
-        for index, event in enumerate(trace, start=1):
-            if not isinstance(event, dict):
-                continue
-            node = str(event.get("node", "step")).strip() or "step"
-            async with cl.Step(name="{} - {}".format(index, node), type="tool") as step:
-                step.output = _format_trace_content(event)
+    if used_rest_fallback:
+        trace = response.get("decision_trace", [])
+        if isinstance(trace, list):
+            for index, event in enumerate(trace, start=1):
+                if not isinstance(event, dict):
+                    continue
+                node = str(event.get("node", "step")).strip() or "step"
+                async with cl.Step(name="{} - {}".format(index, node), type="tool") as trace_step:
+                    trace_step.output = _format_trace_content(event)
 
-    await cl.Message(content=_format_final_response(response)).send()
+    await cl.Message(content=_format_final_response(response, include_explanation=not has_streamed_tokens)).send()

@@ -272,6 +272,35 @@ class AgentFlowIntegrationTestCase(unittest.TestCase):
             self.assertEqual(result.get("llm", {}).get("provider"), "maritaca")
             self.assertNotEqual(result.get("llm", {}).get("model"), "moonshotai/kimi-k2.5")
 
+    def test_resume_without_checkpoint_returns_resume_not_found(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": True, "variants": {"A": {}, "B": {}}}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(problem="", session_id="sessao-ausente", resume=True)
+
+            self.assertEqual(result.get("status"), "resume_not_found")
+            self.assertGreater(len(result.get("errors", [])), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

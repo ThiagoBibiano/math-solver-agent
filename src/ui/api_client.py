@@ -7,6 +7,7 @@ import json
 import logging
 import mimetypes
 import time
+from typing import AsyncIterator
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -212,3 +213,54 @@ def _extract_error_detail(raw_body: str) -> str:
     except json.JSONDecodeError:
         pass
     return raw_body.strip() or "Erro desconhecido"
+
+
+def _to_ws_endpoint(base_url: str) -> str:
+    normalized = base_url.strip().rstrip("/")
+    if normalized.startswith("https://"):
+        return "wss://" + normalized[len("https://") :] + "/v1/solve/stream"
+    if normalized.startswith("http://"):
+        return "ws://" + normalized[len("http://") :] + "/v1/solve/stream"
+    if normalized.startswith("wss://") or normalized.startswith("ws://"):
+        return normalized + "/v1/solve/stream"
+    return "ws://{}/v1/solve/stream".format(normalized)
+
+
+async def stream_solve_api_async(
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout_seconds: int = 120,
+    request_id: Optional[str] = None,
+) -> AsyncIterator[Dict[str, Any]]:
+    """Streams solve events from WS endpoint."""
+    try:
+        import websockets
+        from websockets.exceptions import WebSocketException
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("websockets is required for streaming API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = _to_ws_endpoint(base_url)
+    started_at = time.perf_counter()
+    logger.info("WS connect start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    headers = {"X-Request-ID": request_id} if request_id else None
+    try:
+        async with websockets.connect(
+            endpoint,
+            additional_headers=headers,
+            open_timeout=timeout_seconds,
+            close_timeout=5,
+            max_size=20 * 1024 * 1024,
+        ) as ws:
+            await ws.send(json.dumps(payload, ensure_ascii=False))
+            while True:
+                raw = await ws.recv()
+                parsed = json.loads(raw)
+                if not isinstance(parsed, dict):
+                    continue
+                yield parsed
+                if parsed.get("type") in {"done", "result", "error"} and parsed.get("type") != "result":
+                    break
+    except (OSError, WebSocketException) as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("WS failed endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar no stream da API: {}".format(exc)) from exc
