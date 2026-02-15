@@ -49,13 +49,9 @@ class VerifierTestCase(unittest.TestCase):
         text = r"Comando: \frac{1}{2} e inline \(x\)."
         self.assertEqual(_normalize_latex_delimiters(text), r"Comando: \frac{1}{2} e inline $x$.")
 
-    def test_normalize_replaces_cdotp_with_cdot(self) -> None:
-        text = r"Produto: \(a \cdotp b\) e \[c \cdotp d\]"
-        self.assertEqual(_normalize_latex_delimiters(text), r"Produto: $a \cdot b$ e $$c \cdot d$$")
-
     def test_normalize_replaces_unicode_middle_dot_with_cdot(self) -> None:
         text = r"Produto: \(a · b\) e \[c·d\]"
-        self.assertEqual(_normalize_latex_delimiters(text), r"Produto: $a  \cdot  b$ e $$c \cdot d$$")
+        self.assertEqual(_normalize_latex_delimiters(text), r"Produto: $a  \cdotp  b$ e $$c \cdotp d$$")
 
     def test_normalize_does_not_touch_existing_dollar_math(self) -> None:
         text = r"Já ok: $x^2$ e $$y$$ e também \(z\)."

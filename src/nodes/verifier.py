@@ -71,7 +71,7 @@ def _normalize_latex_delimiters(text: str) -> str:
         return ""
 
     normalized = str(text)
-    normalized = normalized.replace("·", r" \cdot ")
+    normalized = normalized.replace("·", r" \cdotp ")
     normalized = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", normalized, flags=re.DOTALL)
     normalized = re.sub(r"\\\((.*?)\\\)", r"$\1$", normalized, flags=re.DOTALL)
     return normalized

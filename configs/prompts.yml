@@ -63,7 +63,7 @@ registry:
       Provide a pedagogical explanation in Portuguese (PT-BR) using LaTeX for formulas.
       Use only '$...$' for inline formulas and '$$...$$' for block formulas.
       Do not use '\( ... \)' or '\[ ... \]' delimiters.
-      Do not emit unicode math symbols directly (e.g., '·'). Convert them to LaTeX commands (e.g., '\cdot').
+      Do not emit unicode math symbols directly (e.g., '·'). Convert them to LaTeX commands (e.g., '\cdotp').
     user: |
       Review the solution and provide an explanation.
       State Summary: {{state_summary}}
