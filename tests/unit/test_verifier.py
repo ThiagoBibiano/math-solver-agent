@@ -44,6 +44,16 @@ class VerifierTestCase(unittest.TestCase):
         expected = r"Eq:$$\begin{aligned}a&=b\\c&=d\end{aligned}$$"
         self.assertEqual(_normalize_latex_delimiters(text), expected)
 
+    def test_normalize_matrix_environment_inside_block(self) -> None:
+        text = r"Matriz:\[\begin{bmatrix}1 & 2\\3 & 4\end{bmatrix}\]"
+        expected = r"Matriz:$$\begin{bmatrix}1 & 2\\3 & 4\end{bmatrix}$$"
+        self.assertEqual(_normalize_latex_delimiters(text), expected)
+
+    def test_normalize_cases_environment_inside_block(self) -> None:
+        text = r"Sistema:\[\begin{cases}x+y=1\\x-y=3\end{cases}\]"
+        expected = r"Sistema:$$\begin{cases}x+y=1\\x-y=3\end{cases}$$"
+        self.assertEqual(_normalize_latex_delimiters(text), expected)
+
     def test_normalize_preserves_non_delimiter_backslashes(self) -> None:
         # não deve alterar comandos LaTeX, só os delimitadores
         text = r"Comando: \frac{1}{2} e inline \(x\)."

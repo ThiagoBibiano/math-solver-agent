@@ -15,6 +15,7 @@ class _FakeGenerativeClient:
         provider = str(self.config.get("provider", "fake"))
         model = str(self.config.get("model", "fake-model"))
         model_profile = str(self.config.get("model_profile", "fake_profile"))
+        supports_multimodal = bool(self.config.get("supports_multimodal", self.config.get("multimodal_enabled", True)))
         return {
             "enabled": True,
             "provider": provider,
@@ -22,7 +23,8 @@ class _FakeGenerativeClient:
             "model_profile": model_profile,
             "available": True,
             "reason": None,
-            "multimodal_enabled": True,
+            "multimodal_enabled": supports_multimodal,
+            "supports_multimodal": supports_multimodal,
             "api_key_env": str(self.config.get("api_key_env", "NVIDIA_API_KEY")),
             "api_key_present": True,
         }
@@ -300,6 +302,69 @@ class AgentFlowIntegrationTestCase(unittest.TestCase):
 
             self.assertEqual(result.get("status"), "resume_not_found")
             self.assertGreater(len(result.get("errors", [])), 0)
+
+    def test_auto_ocr_requires_text_for_non_multimodal_with_image(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True, "multimodal_enabled": False},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": False}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(problem="", image_base64="aGVsbG8=", image_media_type="image/png", ocr_mode="auto")
+
+            self.assertEqual(result.get("status"), "ocr_required")
+
+    def test_auto_ocr_accepts_pre_extracted_text(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True, "multimodal_enabled": False},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": False}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(
+                    problem="",
+                    image_base64="aGVsbG8=",
+                    image_media_type="image/png",
+                    ocr_mode="auto",
+                    ocr_text="calcule 2+2",
+                )
+
+            self.assertEqual(result.get("status"), "verified")
+            self.assertTrue(bool(result.get("ocr", {}).get("used")))
 
 
 if __name__ == "__main__":

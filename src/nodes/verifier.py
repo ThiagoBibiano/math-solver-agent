@@ -72,9 +72,56 @@ def _normalize_latex_delimiters(text: str) -> str:
 
     normalized = str(text)
     normalized = normalized.replace("·", r" \cdotp ")
-    normalized = re.sub(r"\\\[(.*?)\\\]", r"$$\1$$", normalized, flags=re.DOTALL)
-    normalized = re.sub(r"\\\((.*?)\\\)", r"$\1$", normalized, flags=re.DOTALL)
+    normalized = _replace_latex_delimited_blocks(normalized, open_token=r"\[", close_token=r"\]", left="$$", right="$$")
+    normalized = _replace_latex_delimited_blocks(normalized, open_token=r"\(", close_token=r"\)", left="$", right="$")
     return normalized
+
+
+def _replace_latex_delimited_blocks(text: str, open_token: str, close_token: str, left: str, right: str) -> str:
+    """Replaces balanced LaTeX delimiter pairs while preserving unmatched tokens."""
+    output: list[str] = []
+    index = 0
+    length = len(text)
+
+    while index < length:
+        start = text.find(open_token, index)
+        if start < 0:
+            output.append(text[index:])
+            break
+
+        output.append(text[index:start])
+        closing = _find_matching_delimiter(text, start + len(open_token), open_token, close_token)
+        if closing < 0:
+            output.append(text[start:])
+            break
+
+        inner = text[start + len(open_token) : closing]
+        output.append("{}{}{}".format(left, inner, right))
+        index = closing + len(close_token)
+
+    return "".join(output)
+
+
+def _find_matching_delimiter(text: str, start: int, open_token: str, close_token: str) -> int:
+    """Finds the closing delimiter index for a potentially nested block."""
+    depth = 1
+    cursor = start
+    while cursor < len(text):
+        next_open = text.find(open_token, cursor)
+        next_close = text.find(close_token, cursor)
+        if next_close < 0:
+            return -1
+
+        if 0 <= next_open < next_close:
+            depth += 1
+            cursor = next_open + len(open_token)
+            continue
+
+        depth -= 1
+        if depth == 0:
+            return next_close
+        cursor = next_close + len(close_token)
+    return -1
 
 
 def verify_solution(

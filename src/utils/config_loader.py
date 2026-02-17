@@ -26,7 +26,10 @@ class RuntimeSettings:
 class GraphConfig:
     version: str = "1.0.0"
     runtime: RuntimeSettings = field(default_factory=RuntimeSettings)
+    runtime_control: Dict[str, Any] = field(default_factory=dict)
     llm: Dict[str, Any] = field(default_factory=dict)
+    llm_timeouts: Dict[str, Any] = field(default_factory=dict)
+    ocr: Dict[str, Any] = field(default_factory=dict)
     precision: Dict[str, Any] = field(default_factory=dict)
     resources: Dict[str, Any] = field(default_factory=dict)
     fallback: Dict[str, Any] = field(default_factory=dict)
@@ -64,7 +67,10 @@ def load_graph_config(path: str = "configs/graph_config.yml") -> GraphConfig:
     return GraphConfig(
         version=str(data.get("version", "1.0.0")),
         runtime=runtime,
+        runtime_control=dict(data.get("runtime_control", {})),
         llm=dict(data.get("llm", {})),
+        llm_timeouts=dict(data.get("llm_timeouts", {})),
+        ocr=dict(data.get("ocr", {})),
         precision=dict(data.get("precision", {})),
         resources=dict(data.get("resources", {})),
         fallback=dict(data.get("fallback", {})),

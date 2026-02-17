@@ -9,6 +9,7 @@ import mimetypes
 import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -68,6 +69,9 @@ class LLMRuntimeConfig:
     model_profiles: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     multimodal_enabled: bool = True
     max_image_bytes: int = 5242880
+    request_timeout_seconds: float = 150.0
+    connect_timeout_seconds: float = 10.0
+    read_timeout_seconds: float = 150.0
 
 
 @dataclass
@@ -235,11 +239,15 @@ class GenerativeMathClient:
             model_profiles={},
             multimodal_enabled=multimodal_enabled,
             max_image_bytes=int(raw.get("max_image_bytes", 5242880)),
+            request_timeout_seconds=float(raw.get("request_timeout_seconds", 150)),
+            connect_timeout_seconds=float(raw.get("connect_timeout_seconds", 10)),
+            read_timeout_seconds=float(raw.get("read_timeout_seconds", 150)),
         )
         self.model_profile = selected_profile
         self.logger = logging.getLogger("math_solver_agent.llm")
 
         self._client: Optional[Any] = None
+        self._invoke_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="llm-invoke")
         self._unavailable_reason: Optional[str] = None
         if provider_value == "maritaca" and max_tokens_value != original_max_tokens_value:
             self.logger.info(
@@ -249,6 +257,14 @@ class GenerativeMathClient:
                 selected_profile.alias,
             )
         self._bootstrap()
+
+    def __del__(self) -> None:  # pragma: no cover - interpreter teardown
+        executor = getattr(self, "_invoke_executor", None)
+        if executor is not None:
+            try:
+                executor.shutdown(wait=False, cancel_futures=True)
+            except Exception:
+                pass
 
     @property
     def is_available(self) -> bool:
@@ -300,25 +316,54 @@ class GenerativeMathClient:
             if ChatNVIDIA is None:
                 self._unavailable_reason = "missing_dependency_langchain_nvidia_ai_endpoints"
                 return
-            self._client = ChatNVIDIA(
-                model=self.config.model,
-                api_key=api_key,
-                temperature=self.config.temperature,
-                top_p=self.config.top_p,
-                max_tokens=self.config.max_tokens,
-            )
+            self._client = self._build_nvidia_client(api_key=api_key)
             return
 
         if ChatMaritalk is None:
             self._unavailable_reason = "missing_dependency_langchain_community"
             return
         self.logger.info("maritaca_client_adapter=langchain_community")
-        self._client = ChatMaritalk(
-            model=self.config.model,
-            api_key=api_key,
-            temperature=self.config.temperature,
-            max_tokens=self.config.max_tokens,
+        self._client = self._build_maritaca_client(api_key=api_key)
+
+    def _build_nvidia_client(self, api_key: str) -> Any:
+        assert ChatNVIDIA is not None
+        base_kwargs = {
+            "model": self.config.model,
+            "api_key": api_key,
+            "temperature": self.config.temperature,
+            "top_p": self.config.top_p,
+            "max_tokens": self.config.max_tokens,
+        }
+        timeout_candidates = (
+            {"timeout": self.config.request_timeout_seconds},
+            {"request_timeout": self.config.request_timeout_seconds},
+            {},
         )
+        for timeout_kwargs in timeout_candidates:
+            try:
+                return ChatNVIDIA(**base_kwargs, **timeout_kwargs)
+            except TypeError:
+                continue
+        return ChatNVIDIA(**base_kwargs)
+
+    def _build_maritaca_client(self, api_key: str) -> Any:
+        assert ChatMaritalk is not None
+        base_kwargs = {
+            "model": self.config.model,
+            "api_key": api_key,
+            "temperature": self.config.temperature,
+            "max_tokens": self.config.max_tokens,
+        }
+        timeout_candidates = (
+            {"timeout": self.config.request_timeout_seconds},
+            {},
+        )
+        for timeout_kwargs in timeout_candidates:
+            try:
+                return ChatMaritalk(**base_kwargs, **timeout_kwargs)
+            except TypeError:
+                continue
+        return ChatMaritalk(**base_kwargs)
 
     def _key_candidates(self) -> List[str]:
         """Returns key environment names ordered by lookup preference.
@@ -399,12 +444,32 @@ class GenerativeMathClient:
             bool(image_input),
         )
         try:
-            response = self._client.invoke(
-                messages,
-                **self._invocation_kwargs(),
+            invoke_kwargs = self._invocation_kwargs()
+            invoke_future = self._invoke_executor.submit(self._client.invoke, messages, **invoke_kwargs)
+            response = invoke_future.result(timeout=max(0.1, float(self.config.request_timeout_seconds)))
+        except FutureTimeoutError as exc:
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            self.logger.error(
+                "llm_invoke_timeout provider=%s model=%s elapsed_ms=%.1f timeout_s=%.1f",
+                self.config.provider,
+                self.config.model,
+                elapsed_ms,
+                float(self.config.request_timeout_seconds),
             )
+            raise RuntimeError(
+                "provider_timeout: provider request exceeded {:.1f}s".format(float(self.config.request_timeout_seconds))
+            ) from exc
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            if _looks_like_timeout_exception(exc):
+                self.logger.error(
+                    "llm_invoke_timeout provider=%s model=%s elapsed_ms=%.1f error=%s",
+                    self.config.provider,
+                    self.config.model,
+                    elapsed_ms,
+                    exc,
+                )
+                raise RuntimeError("provider_timeout: {}".format(exc)) from exc
             self.logger.exception(
                 "llm_invoke_failed provider=%s model=%s elapsed_ms=%.1f error=%s",
                 self.config.provider,
@@ -482,7 +547,7 @@ class GenerativeMathClient:
         if not self.is_available:
             return {}
 
-        has_image = bool(image_input and any(image_input.get(k) for k in ("image_url", "image_path", "image_base64")))
+        has_image = _has_any_image_input(image_input)
         system = (prompt_pack or {}).get(
             "system",
             "Você é um analisador matemático rigoroso. Responda apenas JSON válido.",
@@ -529,7 +594,7 @@ class GenerativeMathClient:
         if not self.is_available:
             return {}
 
-        has_image = bool(image_input and any(image_input.get(k) for k in ("image_url", "image_path", "image_base64")))
+        has_image = _has_any_image_input(image_input)
         system = (prompt_pack or {}).get(
             "system",
             "Você é um planejador matemático. Responda apenas JSON válido.",
@@ -575,7 +640,7 @@ class GenerativeMathClient:
         if not self.is_available:
             return {}
 
-        has_image = bool(image_input and any(image_input.get(k) for k in ("image_url", "image_path", "image_base64")))
+        has_image = _has_any_image_input(image_input)
         system = (prompt_pack or {}).get(
             "system",
             "Você é um conversor de linguagem natural para chamadas de ferramentas matemáticas.",
@@ -747,13 +812,42 @@ def _build_human_content(user_prompt: str, image_input: Dict[str, Any], max_imag
         Content blocks including text and optionally image_url block.
     """
     content: List[Dict[str, Any]] = [{"type": "text", "text": user_prompt}]
-    data_url = _resolve_image_data_url(image_input=image_input, max_image_bytes=max_image_bytes)
-    if data_url:
+    for data_url in _resolve_image_data_urls(image_input=image_input, max_image_bytes=max_image_bytes):
         content.append({"type": "image_url", "image_url": {"url": data_url}})
     return content
 
 
 def _resolve_image_data_url(image_input: Dict[str, Any], max_image_bytes: int) -> Optional[str]:
+    """Backward-compatible helper that returns the first resolved image URL."""
+    urls = _resolve_image_data_urls(image_input=image_input, max_image_bytes=max_image_bytes)
+    if not urls:
+        return None
+    return urls[0]
+
+
+def _resolve_image_data_urls(image_input: Dict[str, Any], max_image_bytes: int) -> List[str]:
+    """Resolves image payloads into model-consumable URLs/data URLs."""
+    urls: List[str] = []
+    if not isinstance(image_input, dict):
+        return urls
+
+    images = image_input.get("images")
+    if isinstance(images, list):
+        for item in images:
+            if not isinstance(item, dict):
+                continue
+            resolved = _resolve_single_image_data_url(item, max_image_bytes=max_image_bytes)
+            if resolved:
+                urls.append(resolved)
+
+    # Backward-compatible single-image fields.
+    resolved_legacy = _resolve_single_image_data_url(image_input, max_image_bytes=max_image_bytes)
+    if resolved_legacy and resolved_legacy not in urls:
+        urls.append(resolved_legacy)
+    return urls
+
+
+def _resolve_single_image_data_url(image_input: Dict[str, Any], max_image_bytes: int) -> Optional[str]:
     """Resolves image payload to a model-consumable URL or data URL.
 
     Args:
@@ -793,6 +887,20 @@ def _resolve_image_data_url(image_input: Dict[str, Any], max_image_bytes: int) -
     return "data:{};base64,{}".format(resolved_media_type, encoded)
 
 
+def _has_any_image_input(image_input: Optional[Dict[str, Any]]) -> bool:
+    """Checks whether image input contains at least one image."""
+    if not isinstance(image_input, dict):
+        return False
+    if any(image_input.get(k) for k in ("image_url", "image_path", "image_base64")):
+        return True
+    images = image_input.get("images")
+    if isinstance(images, list):
+        for item in images:
+            if isinstance(item, dict) and any(item.get(k) for k in ("image_url", "image_path", "image_base64")):
+                return True
+    return False
+
+
 def _guess_media_type(path: Path) -> Optional[str]:
     """Guesses image media type from a file path.
 
@@ -806,6 +914,11 @@ def _guess_media_type(path: Path) -> Optional[str]:
     if guessed and guessed.startswith("image/"):
         return guessed
     return None
+
+
+def _looks_like_timeout_exception(exc: Exception) -> bool:
+    lowered = str(exc).lower()
+    return "timeout" in lowered or "timed out" in lowered or "deadline exceeded" in lowered
 
 
 def _build_model_profile_registry(raw_profiles: Any) -> Dict[str, ModelProfile]:

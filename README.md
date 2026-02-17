@@ -153,6 +153,10 @@ Endpoints:
 - `GET /health`
 - `POST /v1/solve`
 - `WS /v1/solve/stream`
+- `GET /v1/runtime/status`
+- `POST /v1/jobs/solve`
+- `GET /v1/jobs/{job_id}`
+- `DELETE /v1/jobs/{job_id}`
 - `POST /v1/export`
 
 Exemplo `POST /v1/solve`:
@@ -182,6 +186,18 @@ curl -X POST "http://localhost:8000/v1/solve" \
 ```
 
 Observação: a API resolve automaticamente `api_key_env` com base no `provider` quando esse campo não é enviado.
+
+Exemplo async (jobs):
+
+```bash
+curl -X POST "http://localhost:8000/v1/jobs/solve" \
+  -H "Content-Type: application/json" \
+  -d '{"problem":"Calcule a derivada de x^3"}'
+```
+
+```bash
+curl "http://localhost:8000/v1/jobs/<job_id>"
+```
 
 Exemplo multimodal (`image_url`):
 
@@ -232,7 +248,7 @@ chainlit run src/ui/chainlit_app.py -w
 
 No Chainlit, mantenha `API Base URL` apontando para a API FastAPI (padrao: `http://localhost:8001`).
 
-`timeout_seconds` na UI Chainlit vai de `60` a `1000` segundos (padrao `300`).
+`timeout_seconds` na UI Chainlit vai de `60` a `1000` segundos (padrao `600`).
 A lista de `model_profile` exibe todos os perfis do `graph_config.yml`; a combinacao efetiva `provider/profile` e validada no backend.
 
 Para debug do frontend Chainlit, ajuste o nivel de log:
@@ -256,6 +272,8 @@ A UI Chainlit permite:
 - upload de imagem (PNG/JPG) pelo clipe na caixa de mensagem;
 - seleção de `provider`, `model_profile`, `temperature`, `max_tokens` e `session_id`;
 - exibição de `decision_trace` antes da resposta final;
+- consulta de status operacional (`runtime status`) e feedback de fila/ocupação;
+- execução padrão via jobs assíncronos com polling de progresso (`queued/running/succeeded`);
 - comando `/resume` para retomar checkpoint da sessão ativa.
 - envio de overrides para `/v1/solve` sem precisar informar `api_key_env` (resolvido pelo backend).
 
@@ -270,6 +288,12 @@ Com isso:
 
 - sem LLM disponível, o agente retorna `failed_precondition`;
 - nos endpoints REST (`/v1/solve` e `/v1/export`), a API retorna HTTP `503`.
+
+Resiliência operacional adicional:
+
+- `429` quando o runtime está ocupado (limites de concorrência/fila);
+- `504` quando o request excede `solve_hard_timeout_seconds`;
+- monitoramento em `GET /v1/runtime/status`.
 
 ## Testes
 

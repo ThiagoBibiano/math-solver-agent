@@ -24,7 +24,8 @@ dependencies = [
   "streamlit>=1.38",
   "chainlit>=2.0",
   "httpx>=0.27",
-  "websockets>=12.0"
+  "websockets>=12.0",
+  "rapidocr_onnxruntime>=1.4.4"
 ]
 
 [project.optional-dependencies]

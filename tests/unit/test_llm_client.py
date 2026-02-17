@@ -15,6 +15,7 @@ from src.llm.client import (
     _manual_load_env_file,
     _resolve_api_key,
     _resolve_image_data_url,
+    _resolve_image_data_urls,
 )
 
 
@@ -61,6 +62,33 @@ class LLMClientTestCase(unittest.TestCase):
         )
         self.assertEqual(content[0]["type"], "text")
         self.assertEqual(content[1]["type"], "image_url")
+
+    def test_build_human_content_with_multiple_images(self) -> None:
+        content = _build_human_content(
+            user_prompt="Analise as imagens",
+            image_input={
+                "images": [
+                    {"image_base64": "aGVsbG8=", "image_media_type": "image/png"},
+                    {"image_base64": "d29ybGQ=", "image_media_type": "image/jpeg"},
+                ]
+            },
+            max_image_bytes=1024,
+        )
+        image_parts = [item for item in content if item.get("type") == "image_url"]
+        self.assertEqual(len(image_parts), 2)
+
+    def test_resolve_image_data_urls(self) -> None:
+        urls = _resolve_image_data_urls(
+            image_input={
+                "images": [
+                    {"image_base64": "aGVsbG8=", "image_media_type": "image/png"},
+                    {"image_base64": "d29ybGQ=", "image_media_type": "image/jpeg"},
+                ]
+            },
+            max_image_bytes=1024,
+        )
+        self.assertEqual(len(urls), 2)
+        self.assertTrue(urls[0].startswith("data:image/png;base64,"))
 
     def test_resolve_api_key_with_strip(self) -> None:
         with patch.dict(os.environ, {"NVIDIA_API_KEY": "  test-key  "}, clear=False):

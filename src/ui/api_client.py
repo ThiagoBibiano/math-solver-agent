@@ -26,6 +26,15 @@ class SolveInput:
     image_media_type: str = "image/png"
 
 
+@dataclass
+class ImageAttachment:
+    """Represents one local image attachment collected by frontend UI."""
+
+    image_bytes: bytes
+    image_filename: Optional[str] = None
+    image_media_type: Optional[str] = None
+
+
 def encode_image_bytes(image_bytes: bytes) -> str:
     """Encodes raw image bytes as base64 text.
 
@@ -58,8 +67,12 @@ def build_solve_payload(
     problem: str,
     session_id: Optional[str] = None,
     resume: bool = False,
+    analysis_only: bool = False,
+    ocr_mode: str = "auto",
+    ocr_text: Optional[str] = None,
     image_bytes: Optional[bytes] = None,
     image_filename: Optional[str] = None,
+    image_attachments: Optional[list[Any]] = None,
     provider: Optional[str] = None,
     model_profile: Optional[str] = None,
     model: Optional[str] = None,
@@ -88,7 +101,12 @@ def build_solve_payload(
         "problem": cleaned_problem,
         "session_id": session_id,
         "resume": bool(resume),
+        "analysis_only": bool(analysis_only),
+        "ocr_mode": str(ocr_mode or "auto").strip().lower() or "auto",
     }
+    cleaned_ocr_text = str(ocr_text or "").strip()
+    if cleaned_ocr_text:
+        payload["ocr_text"] = cleaned_ocr_text
 
     override_fields = {
         "provider": provider,
@@ -106,11 +124,44 @@ def build_solve_payload(
             continue
         payload[key] = value
 
-    if image_bytes:
-        payload["image_base64"] = encode_image_bytes(image_bytes)
-        payload["image_media_type"] = infer_image_media_type(image_filename or "")
+    images_payload: list[Dict[str, str]] = []
+    if image_attachments:
+        for attachment in image_attachments:
+            if isinstance(attachment, ImageAttachment):
+                raw_bytes = attachment.image_bytes
+                raw_name = attachment.image_filename
+                raw_mime = attachment.image_media_type
+            elif isinstance(attachment, dict):
+                raw_bytes = attachment.get("image_bytes")
+                raw_name = attachment.get("image_filename")
+                raw_mime = attachment.get("image_media_type")
+            else:
+                continue
+            if not raw_bytes:
+                continue
+            media_type = str(raw_mime or "").strip() or infer_image_media_type(str(raw_name or ""))
+            images_payload.append(
+                {
+                    "image_base64": encode_image_bytes(raw_bytes),
+                    "image_media_type": media_type,
+                }
+            )
 
-    if not cleaned_problem and not resume and "image_base64" not in payload:
+    if image_bytes:
+        legacy_media_type = infer_image_media_type(image_filename or "")
+        payload["image_base64"] = encode_image_bytes(image_bytes)
+        payload["image_media_type"] = legacy_media_type
+        images_payload.append(
+            {
+                "image_base64": payload["image_base64"],
+                "image_media_type": legacy_media_type,
+            }
+        )
+
+    if images_payload:
+        payload["images"] = images_payload
+
+    if not cleaned_problem and not resume and "images" not in payload and "image_base64" not in payload:
         raise ValueError("Informe texto, imagem, ou ambos.")
 
     return payload
@@ -182,6 +233,256 @@ async def call_solve_api_async(
         raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
 
     endpoint = base_url.rstrip("/") + "/v1/solve"
+    started_at = time.perf_counter()
+    logger.info("HTTP POST start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            headers = {"X-Request-ID": request_id} if request_id else None
+            response = await client.post(endpoint, json=payload, headers=headers)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            logger.info("HTTP POST done endpoint=%s status=%s elapsed_ms=%.1f", endpoint, response.status_code, elapsed_ms)
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response.text)
+                raise RuntimeError("API error {}: {}".format(response.status_code, detail))
+            return response.json()
+    except httpx.ConnectError as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP connect error endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar na API: {}".format(exc)) from exc
+    except httpx.TimeoutException as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP timeout endpoint=%s elapsed_ms=%.1f", endpoint, elapsed_ms)
+        raise RuntimeError("Timeout ao consultar API apos {}s".format(timeout_seconds)) from exc
+
+
+async def call_export_api_async(
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout_seconds: int = 120,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Calls REST export endpoint asynchronously using httpx."""
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = base_url.rstrip("/") + "/v1/export"
+    started_at = time.perf_counter()
+    logger.info("HTTP POST start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            headers = {"X-Request-ID": request_id} if request_id else None
+            response = await client.post(endpoint, json=payload, headers=headers)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            logger.info("HTTP POST done endpoint=%s status=%s elapsed_ms=%.1f", endpoint, response.status_code, elapsed_ms)
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response.text)
+                raise RuntimeError("API error {}: {}".format(response.status_code, detail))
+            return response.json()
+    except httpx.ConnectError as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP connect error endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar na API: {}".format(exc)) from exc
+    except httpx.TimeoutException as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP timeout endpoint=%s elapsed_ms=%.1f", endpoint, elapsed_ms)
+        raise RuntimeError("Timeout ao consultar API apos {}s".format(timeout_seconds)) from exc
+
+
+async def call_sessions_api_async(
+    base_url: str,
+    limit: int = 10,
+    timeout_seconds: int = 60,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Calls sessions listing endpoint asynchronously using httpx."""
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = base_url.rstrip("/") + "/v1/sessions"
+    started_at = time.perf_counter()
+    params = {"limit": max(1, min(int(limit), 100))}
+    logger.info("HTTP GET start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            headers = {"X-Request-ID": request_id} if request_id else None
+            response = await client.get(endpoint, params=params, headers=headers)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            logger.info("HTTP GET done endpoint=%s status=%s elapsed_ms=%.1f", endpoint, response.status_code, elapsed_ms)
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response.text)
+                raise RuntimeError("API error {}: {}".format(response.status_code, detail))
+            return response.json()
+    except httpx.ConnectError as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP connect error endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar na API: {}".format(exc)) from exc
+    except httpx.TimeoutException as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP timeout endpoint=%s elapsed_ms=%.1f", endpoint, elapsed_ms)
+        raise RuntimeError("Timeout ao consultar API apos {}s".format(timeout_seconds)) from exc
+
+
+async def call_runtime_status_api_async(
+    base_url: str,
+    timeout_seconds: int = 60,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Calls runtime status endpoint asynchronously using httpx."""
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = base_url.rstrip("/") + "/v1/runtime/status"
+    started_at = time.perf_counter()
+    logger.info("HTTP GET start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            headers = {"X-Request-ID": request_id} if request_id else None
+            response = await client.get(endpoint, headers=headers)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            logger.info("HTTP GET done endpoint=%s status=%s elapsed_ms=%.1f", endpoint, response.status_code, elapsed_ms)
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response.text)
+                raise RuntimeError("API error {}: {}".format(response.status_code, detail))
+            return response.json()
+    except httpx.ConnectError as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP connect error endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar na API: {}".format(exc)) from exc
+    except httpx.TimeoutException as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP timeout endpoint=%s elapsed_ms=%.1f", endpoint, elapsed_ms)
+        raise RuntimeError("Timeout ao consultar API apos {}s".format(timeout_seconds)) from exc
+
+
+async def call_solve_job_submit_api_async(
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout_seconds: int = 60,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Submits a solve job asynchronously using httpx."""
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = base_url.rstrip("/") + "/v1/jobs/solve"
+    started_at = time.perf_counter()
+    logger.info("HTTP POST start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            headers = {"X-Request-ID": request_id} if request_id else None
+            response = await client.post(endpoint, json=payload, headers=headers)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            logger.info("HTTP POST done endpoint=%s status=%s elapsed_ms=%.1f", endpoint, response.status_code, elapsed_ms)
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response.text)
+                raise RuntimeError("API error {}: {}".format(response.status_code, detail))
+            return response.json()
+    except httpx.ConnectError as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP connect error endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar na API: {}".format(exc)) from exc
+    except httpx.TimeoutException as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP timeout endpoint=%s elapsed_ms=%.1f", endpoint, elapsed_ms)
+        raise RuntimeError("Timeout ao consultar API apos {}s".format(timeout_seconds)) from exc
+
+
+async def call_solve_job_status_api_async(
+    base_url: str,
+    job_id: str,
+    timeout_seconds: int = 60,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Polls solve job status asynchronously using httpx."""
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = base_url.rstrip("/") + "/v1/jobs/{}".format(job_id)
+    started_at = time.perf_counter()
+    logger.info("HTTP GET start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            headers = {"X-Request-ID": request_id} if request_id else None
+            response = await client.get(endpoint, headers=headers)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            logger.info("HTTP GET done endpoint=%s status=%s elapsed_ms=%.1f", endpoint, response.status_code, elapsed_ms)
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response.text)
+                raise RuntimeError("API error {}: {}".format(response.status_code, detail))
+            return response.json()
+    except httpx.ConnectError as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP connect error endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar na API: {}".format(exc)) from exc
+    except httpx.TimeoutException as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP timeout endpoint=%s elapsed_ms=%.1f", endpoint, elapsed_ms)
+        raise RuntimeError("Timeout ao consultar API apos {}s".format(timeout_seconds)) from exc
+
+
+async def call_solve_job_cancel_api_async(
+    base_url: str,
+    job_id: str,
+    timeout_seconds: int = 60,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Cancels solve job asynchronously using httpx."""
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = base_url.rstrip("/") + "/v1/jobs/{}".format(job_id)
+    started_at = time.perf_counter()
+    logger.info("HTTP DELETE start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
+    try:
+        async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+            headers = {"X-Request-ID": request_id} if request_id else None
+            response = await client.delete(endpoint, headers=headers)
+            elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+            logger.info(
+                "HTTP DELETE done endpoint=%s status=%s elapsed_ms=%.1f",
+                endpoint,
+                response.status_code,
+                elapsed_ms,
+            )
+            if response.status_code >= 400:
+                detail = _extract_error_detail(response.text)
+                raise RuntimeError("API error {}: {}".format(response.status_code, detail))
+            return response.json()
+    except httpx.ConnectError as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP connect error endpoint=%s elapsed_ms=%.1f error=%s", endpoint, elapsed_ms, exc)
+        raise RuntimeError("Nao foi possivel conectar na API: {}".format(exc)) from exc
+    except httpx.TimeoutException as exc:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000.0
+        logger.error("HTTP timeout endpoint=%s elapsed_ms=%.1f", endpoint, elapsed_ms)
+        raise RuntimeError("Timeout ao consultar API apos {}s".format(timeout_seconds)) from exc
+
+
+async def call_ocr_extract_api_async(
+    base_url: str,
+    payload: Dict[str, Any],
+    timeout_seconds: int = 120,
+    request_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Calls OCR extraction endpoint asynchronously using httpx."""
+    try:
+        import httpx
+    except ImportError as exc:  # pragma: no cover - optional dependency
+        raise RuntimeError("httpx is required for async API calls. Install dependencies from pyproject.toml.") from exc
+
+    endpoint = base_url.rstrip("/") + "/v1/ocr/extract"
     started_at = time.perf_counter()
     logger.info("HTTP POST start endpoint=%s timeout=%ss", endpoint, timeout_seconds)
     try:
