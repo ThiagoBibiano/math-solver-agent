@@ -520,6 +520,32 @@ def _build_final_actions(response: Dict[str, Any]) -> list[Any]:
     return actions
 
 
+def _build_follow_up_prompt(base_prompt: str, last_response: Optional[Dict[str, Any]]) -> str:
+    prompt = str(base_prompt or "").strip()
+    if not isinstance(last_response, dict):
+        return prompt
+
+    normalized_problem = str(last_response.get("normalized_problem", "")).strip()
+    result = str(last_response.get("result", "")).strip()
+    numeric = last_response.get("numeric_result")
+    explanation = str(last_response.get("explanation", "")).strip()
+    tool_call = last_response.get("tool_call") if isinstance(last_response.get("tool_call"), dict) else {}
+    tool_name = str(tool_call.get("name", "")).strip()
+
+    blocks = [
+        "Use obrigatoriamente o contexto da resposta anterior abaixo.",
+        "Problema anterior: {}".format(normalized_problem or "-"),
+        "Resultado simbolico anterior: {}".format(result or "-"),
+        "Resultado numerico anterior: {}".format(numeric if numeric is not None else "-"),
+    ]
+    if tool_name:
+        blocks.append("Ferramenta usada anteriormente: {}".format(tool_name))
+    if explanation:
+        blocks.append("Explicacao anterior (resumo): {}".format(explanation[:1200]))
+    blocks.append("Pedido atual: {}".format(prompt))
+    return "\n\n".join(blocks)
+
+
 def _build_session_actions(sessions: list[Dict[str, Any]]) -> list[Any]:
     actions: list[Any] = []
     for item in sessions[:8]:
@@ -747,13 +773,16 @@ async def _run_follow_up_request(prompt: str) -> None:
     settings = _normalize_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
     thread_id = _resolve_chainlit_thread_id()
     active_session_id = cl.user_session.get(SESSION_ACTIVE_ID_KEY)
-    session_id = thread_id or settings.get("session_id") or active_session_id
+    session_id = settings.get("session_id") or active_session_id or thread_id
     request_id = str(uuid.uuid4())[:8]
+    last_response = cl.user_session.get(SESSION_LAST_RESPONSE_KEY)
+    follow_up_prompt = _build_follow_up_prompt(prompt, last_response if isinstance(last_response, dict) else None)
+    use_resume = bool(session_id)
 
     payload = build_solve_payload(
-        problem=prompt,
+        problem=follow_up_prompt,
         session_id=session_id,
-        resume=False,
+        resume=use_resume,
         ocr_mode=settings.get("ocr_mode", "auto"),
         provider=settings.get("provider"),
         model_profile=settings.get("model_profile"),
@@ -927,7 +956,14 @@ async def on_generate_plot_action(action: Any) -> None:  # pragma: no cover - ru
     if not expression:
         await cl.Message(content="Nao foi possivel identificar uma expressao nao ambigua para gerar grafico.").send()
         return
-    await _run_follow_up_request("Gere um grafico 2D para a expressao {}.".format(expression))
+    await _run_follow_up_request(
+        (
+            "Gere um grafico 2D para a expressao solicitada.\n"
+            "[PLOT_REQUEST]\n"
+            "expression: {}\n"
+            "[/PLOT_REQUEST]"
+        ).format(expression)
+    )
 
 
 @cl.on_chat_start
@@ -1002,7 +1038,7 @@ async def on_message(message: cl.Message) -> None:
     settings = _normalize_settings(cl.user_session.get(SESSION_SETTINGS_KEY))
     thread_id = _resolve_chainlit_thread_id()
     active_session_id = cl.user_session.get(SESSION_ACTIVE_ID_KEY)
-    session_id = thread_id or settings.get("session_id") or active_session_id
+    session_id = settings.get("session_id") or active_session_id or thread_id
 
     raw_content = (message.content or "").strip()
     lowered = raw_content.lower()

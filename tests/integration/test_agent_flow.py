@@ -63,6 +63,18 @@ class _UnavailableGenerativeClient(_FakeGenerativeClient):
         return payload
 
 
+class _FakeAnalyzerDropsMarkerClient(_FakeGenerativeClient):
+    def analyze_problem(self, problem, prompt_pack=None, prompt_variant=None, image_input=None):
+        del prompt_pack, prompt_variant, image_input
+        return {
+            "domain": "calculo_i",
+            "constraints": [],
+            "complexity_score": 0.2,
+            "plan": ["analisar", "converter", "executar", "verificar"],
+            "normalized_problem": "pedido normalizado sem marcador explicito",
+        }
+
+
 class AgentFlowIntegrationTestCase(unittest.TestCase):
     def test_flow_runs_end_to_end_with_fake_llm(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -303,6 +315,38 @@ class AgentFlowIntegrationTestCase(unittest.TestCase):
             self.assertEqual(result.get("status"), "resume_not_found")
             self.assertGreater(len(result.get("errors", [])), 0)
 
+    def test_resume_with_follow_up_prompt_keeps_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeGenerativeClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": False}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                first = agent.solve(problem="2+2", session_id="sessao-memoria", resume=False)
+                second = agent.solve(problem="Explique melhor o resultado.", session_id="sessao-memoria", resume=True)
+
+            self.assertEqual(first.get("status"), "verified")
+            merged_problem = str(second.get("problem", ""))
+            self.assertIn("2+2", merged_problem)
+            self.assertIn("Explique melhor o resultado.", merged_problem)
+
     def test_auto_ocr_requires_text_for_non_multimodal_with_image(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             config = GraphConfig(
@@ -365,6 +409,45 @@ class AgentFlowIntegrationTestCase(unittest.TestCase):
 
             self.assertEqual(result.get("status"), "verified")
             self.assertTrue(bool(result.get("ocr", {}).get("used")))
+
+    def test_forced_plot_action_survives_analyzer_normalization(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config = GraphConfig(
+                version="1.0.0",
+                runtime=RuntimeSettings(
+                    max_iterations=2,
+                    divergence_patience=2,
+                    checkpoint_dir=tmpdir,
+                    default_timeout_seconds=5,
+                    operation_timeouts={"analysis": 3, "planning": 3, "solving": 3, "verification": 3},
+                ),
+                llm={"require_available": True},
+            )
+
+            with patch("src.agents.graph.GenerativeMathClient", _FakeAnalyzerDropsMarkerClient), patch(
+                "src.agents.graph.load_graph_config", return_value=config
+            ), patch(
+                "src.agents.graph.load_prompts_config",
+                return_value={"experiments": {"ab_testing": {"enabled": False}}},
+            ), patch(
+                "src.agents.graph.load_prompts_registry",
+                return_value={"analyzer": {"system": "x"}, "converter": {"system": "x"}, "solver": {"system": "x"}},
+            ):
+                agent = MathSolverAgent()
+                result = agent.solve(
+                    problem=(
+                        "Gere um grafico.\n"
+                        "[PLOT_REQUEST]\n"
+                        "expression: x^2 - 4\n"
+                        "[/PLOT_REQUEST]"
+                    ),
+                    session_id="sessao-plot-forcado",
+                    resume=False,
+                )
+
+            self.assertEqual(result.get("status"), "verified")
+            self.assertEqual(result.get("tool_call", {}).get("name"), "plot_function_2d")
+            self.assertTrue(bool(result.get("artifacts")))
 
 
 if __name__ == "__main__":

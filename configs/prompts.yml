@@ -7,7 +7,7 @@ registry:
       Always reason step-by-step before providing the final structured output.
     tool: |
       Available tools: differentiate_expression, integrate_expression, solve_equation,
-      simplify_expression, evaluate_expression, numerical_integration, solve_ode.
+      simplify_expression, evaluate_expression, numerical_integration, solve_ode, plot_function_2d.
       Use only these tools and follow their argument schemas strictly.
   analyzer:
     extends: base

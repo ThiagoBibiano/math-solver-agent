@@ -32,6 +32,7 @@ class AgentState(TypedDict, total=False):
     llm: Dict[str, Any]
     ocr: Dict[str, Any]
     visual_input: Dict[str, Any]
+    forced_tool_call: Dict[str, Any]
     tool_plan: Dict[str, Any]
     tool_call: Dict[str, Any]
     tool_result: Dict[str, Any]
@@ -80,6 +81,7 @@ def build_initial_state(problem: str, session_id: str, max_iterations: int, time
         llm={},
         ocr={},
         visual_input={},
+        forced_tool_call={},
         tool_plan={},
         tool_call={},
         tool_result={},

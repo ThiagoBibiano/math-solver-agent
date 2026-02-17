@@ -13,6 +13,7 @@ from typing import Any, AsyncIterator, Callable, Dict, Iterable, Iterator, Optio
 from src.agents.state import AgentState, build_initial_state
 from src.llm import GenerativeMathClient
 from src.nodes import analyze_problem, convert_to_tool_syntax, solve_problem, verify_solution
+from src.tools.utils import SanitizationError, sanitize_math_expression
 from src.utils.config_loader import (
     GraphConfig,
     load_graph_config,
@@ -221,6 +222,53 @@ def should_use_ocr(
     if mode == "off":
         return False
     return not supports_multimodal
+
+
+def _merge_follow_up_problem(existing_problem: str, follow_up_prompt: str) -> str:
+    """Merges follow-up intent into resumed problem context."""
+    base = str(existing_problem or "").strip()
+    follow_up = str(follow_up_prompt or "").strip()
+    if not follow_up:
+        return base
+    if not base:
+        return follow_up
+    return "{}\n\n### Pedido de follow-up\n{}".format(base, follow_up)
+
+
+def _extract_forced_plot_expression(problem_text: str) -> Optional[str]:
+    """Extracts explicit plot expression markers from one request prompt."""
+    text = str(problem_text or "")
+    start = "[PLOT_REQUEST]"
+    end = "[/PLOT_REQUEST]"
+    if start not in text or end not in text:
+        return None
+    segment = text.split(start, 1)[1].split(end, 1)[0]
+    for line in segment.splitlines():
+        stripped = line.strip()
+        if not stripped or ":" not in stripped:
+            continue
+        key, value = stripped.split(":", 1)
+        if key.strip().lower() != "expression":
+            continue
+        expression = value.strip().strip("`")
+        if not expression:
+            return None
+        try:
+            return sanitize_math_expression(expression, max_length=1000)
+        except SanitizationError:
+            return None
+    return None
+
+
+def _extract_forced_tool_call(problem_text: str) -> Dict[str, Any]:
+    """Builds a structured forced tool-call hint from user prompt markers."""
+    expression = _extract_forced_plot_expression(problem_text)
+    if not expression:
+        return {}
+    return {
+        "name": "plot_function_2d",
+        "args": {"expression": expression},
+    }
 
 
 class MathSolverAgent:
@@ -440,12 +488,21 @@ class MathSolverAgent:
     ) -> tuple[AgentState, GenerativeMathClient, Optional[Any]]:
         """Builds request-scoped state and runtime dependencies."""
         sid = session_id or str(uuid.uuid4())
+        incoming_problem = str(problem or "").strip()
+        forced_tool_call = _extract_forced_tool_call(incoming_problem)
 
         if resume:
             resumed = self.checkpoints.load(sid)
             if resumed:
                 state = resumed
                 state["status"] = "resumed"
+                if incoming_problem:
+                    merged_problem = _merge_follow_up_problem(
+                        existing_problem=str(state.get("problem") or ""),
+                        follow_up_prompt=incoming_problem,
+                    )
+                    state["problem"] = merged_problem
+                    state["normalized_problem"] = merged_problem
             else:
                 state = self._new_state(problem, sid)
                 state["status"] = "resume_not_found"
@@ -453,6 +510,9 @@ class MathSolverAgent:
                 self.checkpoints.save(state)
         else:
             state = self._new_state(problem, sid)
+
+        # Always recompute per request to avoid stale forcing from previous checkpoints.
+        state["forced_tool_call"] = forced_tool_call
 
         request_llm_client = self._resolve_request_llm_client(llm_overrides)
         state["prompt_variant"] = select_prompt_variant(self.prompt_config, sid)
